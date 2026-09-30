@@ -163,6 +163,81 @@ cp /root/cdtguard.py.new /root/cdtguard.py && rc-service cdtguard restart
 > **不要用「日志里 ERR=0」当验收** —— 死掉的守护不写日志，恒为 0。
 > **能通过一个已经死掉的守护的标准不是标准。**
 
+### 第 4.5 步：运维动线 —— 只换一个值时怎么改
+
+**换 `PUSH_TOKEN`（换网关账号 / token 失效）是最常见的一次运维。**
+它有两个落点，**两个都要改**，而且是两套机制：
+
+| 落点 | 在哪 | 怎么改 |
+|---|---|---|
+| **ECS 守护** | 实例上 `/root/cdtguard.py` 的 `PUSH_TOKEN` 那一行 | **改文件**（环境变量送不进去，见下） |
+| **FC 兜底** | FC 函数的 `PUSH_TOKEN` **环境变量** | **改环境变量**（不是文件） |
+
+> ⚠️⚠️ **为什么 ECS 侧必须改文件、不能 export**：
+> 守护由 `supervise-daemon` 拉起，它**会清空子进程环境** ——
+> `export`、`.env`、`/etc/conf.d/cdtguard` 全都送不进去。
+> 改完必须**重启服务**才生效（`PUSH_TOKEN` 是模块级常量，进程启动时读一次）。
+
+**ECS 侧：一条命令替换 + 校验 + 重启**（在实例上以 root 执行）：
+
+```sh
+cd /root
+cp -p cdtguard.py cdtguard.py.bak.$(date +%Y%m%d-%H%M%S)   # 先备份
+
+# ⚠️ 用 python 读 token 而不是写进命令行 —— 避免它落进 shell history / ps 输出
+read -r -p "新 PUSH_TOKEN: " TOK
+python3 - "$TOK" <<'PY'
+import io, re, sys
+tok = sys.argv[1]
+assert re.fullmatch(r"[0-9a-fA-F]{32}", tok), "token 形态不对（pushplus 是 32 位十六进制）"
+p = "/root/cdtguard.py"
+s = io.open(p, encoding="utf-8").read()
+# 行首锚定：只改模块级那一行，不会碰注释与函数体里的引用
+new, n = re.subn(r'^PUSH_TOKEN = .*$',
+                 'PUSH_TOKEN = os.environ.get("PUSH_TOKEN", "%s")' % tok,
+                 s, count=1, flags=re.M)
+assert n == 1, "没找到唯一的 PUSH_TOKEN 赋值行（命中 %d 次）—— 别用 sed，先人工看一眼" % n
+io.open(p, "w", encoding="utf-8", newline="").write(new)
+print("OK 已替换")
+PY
+
+python3 -m py_compile cdtguard.py && echo COMPILE_OK     # 语法不过就别重启
+grep -c '<YOUR_' cdtguard.py                              # 应为 0
+rc-service cdtguard restart
+sleep 3 && tail -5 /var/log/cdtguard.log                  # 看有没有 push[...] -> {"code":200}
+unset TOK
+```
+
+> 🔴 **验证只看一个信号：日志里 `push[CDT 守护已启动] -> {"code":200,...}`。**
+> 守护**每次启动都会推一条**（`main()` 开头那次 `rpt("CDT 守护已启动", …)`），
+> 所以重启后 tail 一下就能确认新 token 是活的。
+> **`rc-service status` 显示 started 不能证明推送能发出去** —— 那正是本仓库反复强调的假信号。
+>
+> ⚠️ **HTTP 200 ≠ 推送成功。** pushplus 的业务错误码在响应体里：
+> **未实名认证会返回 `905`**（见 [`docs/toolchain.md`](docs/toolchain.md) 第二节）；
+> token 写错一般是 `401`/`403` 一类。**必须看 `code` 字段，不能只看有没有异常。**
+>
+> 💡 **想立刻单独验一次、不重启守护**：在实例上直接怼一次网关即可 ——
+> `python3 -c 'import json,urllib.request,sys;b=json.dumps({"token":sys.argv[1],"title":"test","content":"ok","template":"txt","channel":"wechat"}).encode();print(urllib.request.urlopen(urllib.request.Request("https://www.pushplus.plus/send",data=b,headers={"Content-Type":"application/json"},method="POST"),timeout=10).read().decode())' '<新token>'`
+
+**FC 侧：改环境变量，走部署脚本（别手点控制台）**
+
+`environment_variables` 是**整体覆盖**语义 —— 控制台上少填一个键就是删掉一个键。
+所以用仓库里的脚本，它是「Get 读回 → 原样合并 → 写回」：
+
+```sh
+python3 scripts/deploy-fc.py scripts/fc-keeper/index.js --dry   # 先预检：读回 12 个键、必需键齐全
+# 改本地环境里的 PUSH_TOKEN，或直接改 FC 控制台里的那个键，然后正式部署：
+python3 scripts/deploy-fc.py scripts/fc-keeper/index.js         # 部署后会自动调用一次并断言 ver
+```
+
+> ⚠️ **FC 侧的 `PUSH_TOKEN` 缺失 = 函数直接抛错拒绝启动**（`requireEnv()`），
+> 不像 ECS 侧那样能降级。所以改这一侧时**别把键删了**，只换值。
+>
+> 📌 **换 token 不会影响停机**：`PUSH_TOKEN` 只被 `notify()` 用，
+> 停机路径（`do_stop()`）不依赖它，推送失败也只记一行日志、不抛。
+> **但「静默失效」正是本仓库最不想要的失败模式** —— 换完一定要按上面的 `code:200` 验一次。
+
 ### 第 5 步：端到端验收
 
 **没有这一步，整套系统只是「看起来在跑」。** 但**必须按下面两个子步骤安全地做** ——

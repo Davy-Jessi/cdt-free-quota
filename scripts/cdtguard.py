@@ -1419,7 +1419,9 @@ def main():
                         log("DRY_RUN 模式：跳过 tag_halted（不打真实停机锁）")
                     else:
                         tag_halted(st["month"])
-                    log("tagged cdt-halted-month=%s" % st["month"])
+                        # ⚠️ 这条日志必须在 else 里 —— 放外面会在 DRY_RUN 下
+                        #    声称"已打标"而实际没打，是最容易把演练结论带偏的谎。
+                        log("tagged cdt-halted-month=%s" % st["month"])
                 except Exception as e:
                     log("tag ERR %s" % str(e)[:150])
                 # 必须在 do_stop() 之前推送：ForceStop 会立刻杀死本进程，
@@ -1450,7 +1452,8 @@ def main():
                              "bw_lag_s": (round(bw_lag_s, 1) if bw_lag_s is not None else None),
                              "bw_base_gb": round(bw_base / 1073741824.0, 4),
                              "reason": "threshold-hit"})
-                    log("oss halted=1 written BEFORE stop")
+                    log("oss halted=%d written BEFORE stop"
+                        % (0 if DRY_RUN else 1))
                 except Exception as e:
                     log("oss pre-stop ERR %s" % str(e)[:150])
                 # （原先这里有一笔 rpt("...正在强制停机")，已上移为
