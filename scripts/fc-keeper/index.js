@@ -113,7 +113,10 @@ const OSS_ENDPOINT = process.env.OSS_ENDPOINT || 'oss-cn-hongkong.aliyuncs.com';
 //    删了它 = 每次调用都抛 ReferenceError = 整条 FC 兜底静默失效。
 //    改动时**递增**，别把日期写进来。
 //    本值不描述任何具体部署环境 —— 它是一个纯粹的功能版本号。
-const VER = 'v2-oss-unreadable-merged';
+//    ⚠️ **递增是硬要求**：`deploy-fc.py` 的部署后断言是「运行时自报的 ver == 源码里的 ver」。
+//       改了代码却不递增，这个断言**必然通过** —— 却证明不了新代码在跑（热实例问题）。
+//       v3：存活巡检分支不再重复读 OSS（复用已读到的 `st`）。
+const VER = 'v3-liveness-reuse-oss';
 const STATE_KEY = 'cdtguard/state.json';
 const PUSH_TOKEN = requireEnv('PUSH_TOKEN');
 const HALT_TAG = 'cdt-halted-month';
