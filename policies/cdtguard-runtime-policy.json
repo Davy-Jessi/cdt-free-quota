@@ -1,0 +1,66 @@
+{
+  "Version": "1",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeInstances",
+        "ecs:StopInstance",
+        "ecs:TagResources",
+        "ecs:UntagResources"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "vpc:DescribeEipAddresses"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "cms:QueryMetricList"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "cdt:ListCdtInternetTraffic"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "oss:GetObject",
+        "oss:PutObject"
+      ],
+      "Resource": "acs:oss:*:*:<YOUR_OSS_BUCKET>/cdtguard/*"
+    },
+    {
+      "Effect": "Deny",
+      "Action": [
+        "vpc:CreateCommonBandwidthPackage",
+        "vpc:ModifyCommonBandwidthPackageSpec",
+        "vpc:ModifyCommonBandwidthPackageAttribute",
+        "vpc:AddCommonBandwidthPackageIp",
+        "vpc:AddCommonBandwidthPackageIps",
+        "vpc:ModifyCommonBandwidthPackageIpBandwidth",
+        "vpc:AllocateEipAddress",
+        "vpc:AllocateEipAddressPro",
+        "vpc:ModifyEipAddressAttribute",
+        "ecs:ModifyInstanceNetworkSpec",
+        "ecs:AllocatePublicIpAddress",
+        "bss:ModifyInstance",
+        "bss:CreateOrder",
+        "bss:PayOrder",
+        "bss:RenewInstance",
+        "bss:ModifyInstanceAutoRenewAttribute"
+      ],
+      "Resource": "*"
+    }
+  ]
+}

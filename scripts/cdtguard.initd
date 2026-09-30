@@ -1,0 +1,51 @@
+#!/sbin/openrc-run
+# CDT 守护的 OpenRC 服务定义。
+#
+# 部署：cp cdtguard.initd /etc/init.d/cdtguard && chmod +x /etc/init.d/cdtguard
+#       rc-update add cdtguard default
+#       rc-service cdtguard start
+#
+# ⚠️⚠️ **本文件是必需的，不是可选的。** 没有它，`rc-service cdtguard status`
+#     会报「service not found」，而 `scripts/deploy-cdtguard.sh` 的验收步骤
+#     整段都会失败。⚠️ 所以别把它只写成注释塞在 `cdtguard.py` 尾部 ——
+#     很容易那么干，但读者按文档走会卡在这里。
+#
+# ── 三个关键选择，都是踩过坑才定下来的 ──────────────────────────────
+#
+# 1) `supervisor="supervise-daemon"`
+#    守护异常退出后自动重启。**但要知道它的副作用**：
+#    ⚠️⚠️ **supervise-daemon 会清空子进程的环境变量。**
+#       实测确认：`/etc/conf.d/cdtguard` 里写的东西**传不进去**，
+#       子进程的 `/proc/<pid>/environ` 里只有 `HOME PATH PWD SHLVL USER`
+#       （不同观测中变量集合不完全一致，
+#        但结论一致：**你自己 export 的变量一定不在里面**）。
+#    后果：**守护的凭据 / 阈值 / 桶名都不能靠环境变量投递** ——
+#    只能写进 `/root/cdtguard.py` 本身。见 `.env.example` 顶部那两条 ⚠️，
+#    以及 `deploy-cdtguard.sh` 的 STEP 4.5（它会逐个检查必须手改的占位符）。
+#
+# 2) `command_args` 里带 `-u`
+#    **禁用 Python 的输出缓冲。** 没有它，日志会成块延迟出现，
+#    排查「守护是不是卡住了」时看到的可能是几十秒前的状态。
+#
+# 3) `output_log` 与 `error_log` 指向同一个文件
+#    守护的 `log()` 走的是 `print()` → **stdout**。
+#    合并到同一个文件是为了 `grep` 时不会漏
+#    （分开写时 `grep` 错文件会得到「日志是空的」的假象）。
+#
+# ⚠️ 但**手动跑演练时要注意**：直接 `python3 cdtguard.py` 的输出进的是
+#    你的终端 / SSH 管道，**不会进这个日志文件** —— 必须自己重定向
+#    （见 SKILL.md 第 5 步）。
+name="cdtguard"
+description="CDT traffic guard (local NIC metering + OSS shared state)"
+command="/usr/bin/python3"
+command_args="-u /root/cdtguard.py"
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+pidfile="/run/cdtguard.pid"
+output_log="/var/log/cdtguard.log"
+error_log="/var/log/cdtguard.log"
+depend() {
+    need net
+    after firewall
+}

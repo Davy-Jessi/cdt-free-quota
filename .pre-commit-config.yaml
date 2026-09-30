@@ -1,0 +1,23 @@
+# 阻止把凭据提交进来。读者克隆本仓库后跑一次 `pre-commit install` 即可生效。
+#
+# ⚠️ 为什么需要它：本仓库的文档里**大量讨论凭据**（哪些该脱敏、踩过什么坑），
+#    所以「顺手把配置填好一起提交」的诱惑特别大。而一旦进了 git 历史，
+#    清理的成本远高于当初避免。
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+        name: gitleaks —— 扫描暂存区的凭据
+
+  - repo: local
+    hooks:
+      # ⚠️ 这个 id/name 说的是它**实际做的事**：抓**真实凭据**的形态。
+      #    占位符形如 <YOUR_AK_ID>，不会命中。
+      #    （早先它叫 `no-placeholder-filled` / 「检查占位符有没有被真实值替换」——
+      #      名字与行为相反，让人以为它在查 `<YOUR_*>` 是否残留。）
+      - id: no-real-credentials
+        name: 暂存区里有没有真实凭据（AK / 私钥 / 各家 token）
+        language: pygrep
+        entry: 'LTAI[0-9A-Za-z]{12,}|BEGIN [A-Z ]*PRIVATE KEY|(?:sk|pk|ghp|gho|glpat)[-_][A-Za-z0-9_-]{20,}'
+        types: [text]

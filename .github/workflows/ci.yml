@@ -1,0 +1,43 @@
+# 把 ci/assert-policies.sh 接上自动触发。
+#
+# 为什么需要这个文件：`ci/assert-policies.sh` 的注释里写着「本地、GitHub Actions、
+# GitLab CI 都能直接调」，但在补这个 workflow 之前**没有任何地方调用它** ——
+# 也就是说那些断言在本地要靠人记得手动跑，在 CI 里永远不会跑。
+# **「写得出来」和「会自己跑」是两件事。**
+#
+# 检查内容（详见 ci/assert-policies.sh，共 5 步）：
+#   1) 策略里的 16 个高危 action —— 既**未放行**、也都被**显式 Deny**
+#   2) 仓库里没有常见凭据形态（占位符形如 <YOUR_XXX>，不会误报）
+#      ⚠️ 本步**不排除任何路径**，包括 ci/ 自己 —— 见脚本里那段注释
+#   3) 泄漏闸：凭据/账号 ID/资源 ID/公网 IP/32 与 64 位 hex 的形状检查
+#      + 已清除值的哈希黑名单（名单不在仓库里，缺失时会显式提示"本层未生效"）
+#      + 「脱敏标记落进代码位置」的检查（例如把云 API 的 Version 参数换成占位符）
+#   4) %-格式化：占位符个数必须与实参一致（这类不匹配只在运行时炸，且常炸在告警路径）
+#   5) 未定义名 / 定义了但从未被调用（此前只在部署脚本里跑，仓库 CI 看不到它）
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    # ⚠️ 钉住具体镜像，不用 `ubuntu-latest`。
+    #    GitHub 已公告 `ubuntu-latest` 会在 2026-10-19 ~ 2026-11-19 之间
+    #    从 24.04 迁到 26.04 —— 那会让「今天绿、明天红」的原因变成一个
+    #    **与本仓库无关**的平台变更。钉住之后，升级镜像是一个**显式动作**。
+    #    要升的时候改成 ubuntu-26.04 并跑一次即可。
+    runs-on: ubuntu-24.04
+    steps:
+      # v7：node24 运行时。
+      # ⚠️ 原来的注释（「v4 的 Node 20 已废弃，运行时会强制升到 Node 24 并告警」）
+      #    已经过期：自 2026-09-23 起 **node20 的 action 在 GitHub 托管 runner 上
+      #    根本不再运行**（连 ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION 逃生口都撤了），
+      #    不存在「强制升级 + 打条告警」这条路径。
+      # v7 唯一的破坏性改动是「默认拒绝在 pull_request_target / workflow_run 下
+      # 检出 fork PR 的代码」—— 本 workflow 只监听 push / pull_request，**不受影响**。
+      - uses: actions/checkout@v7
+      # 脚本用的是 POSIX sh + python3，不需要矩阵。
+      # 刻意不引第三方 action —— 本仓库的定位决定了供应链面越小越好。
+      - name: 跑全部静态断言
+        run: sh ci/assert-policies.sh
