@@ -116,7 +116,7 @@ const OSS_ENDPOINT = process.env.OSS_ENDPOINT || 'oss-cn-hongkong.aliyuncs.com';
 //    ⚠️ **递增是硬要求**：`deploy-fc.py` 的部署后断言是「运行时自报的 ver == 源码里的 ver」。
 //       改了代码却不递增，这个断言**必然通过** —— 却证明不了新代码在跑（热实例问题）。
 //       v3：存活巡检分支不再重复读 OSS（复用已读到的 `st`）。
-const VER = 'v3-liveness-reuse-oss';
+const VER = 'v4-liveness-scope-fix';
 const STATE_KEY = 'cdtguard/state.json';
 const PUSH_TOKEN = requireEnv('PUSH_TOKEN');
 const HALT_TAG = 'cdt-halted-month';
@@ -272,8 +272,15 @@ async function decide(source, evKeys, evResId, isPreempt, isLiveness) {
     //    下面这段拿到的 stTsMs 决定「护闸疑似失联」告警能不能触发；
     //    没有 OSS 桶时 stTsMs=0 ⇒ 告警静默失效。（决策本身仍只依据实例状态与 Tag。）
     let effGb = null, ossHalted = false, stTsMs = 0, ossUnreadable = false;
+    // ⚠️⚠️ `st` 必须在**内层 try 之外**声明。
+    //    写成 `const st = ...` 放 try 里，则块级作用域只到那个 try 为止；
+    //    而下面的 `isLiveness` 分支（同一个函数、但已出了那个块）还要用它
+    //    → **每次存活巡检都抛 ReferenceError: st is not defined**
+    //    → 被 decide() 外层的 catch 兜住 → 整个 8 分钟巡检静默退化成 error。
+    //    实测：`let` 声明于 try 外、try 内赋值，跨块可见。
+    let st = null;
     try {
-      const st = await ossGet(STATE_KEY);
+      st = await ossGet(STATE_KEY);
       if (!st && OSS_BUCKET) {
         // ⚠️ ossGet 对「未配置 bucket」（设计允许）与「读取失败」（故障）都返回
         //    null。必须区分 —— 否则读不到 OSS 时 stTsMs 恒为 0、staleMs 恒为 0
