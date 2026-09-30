@@ -344,9 +344,17 @@ push[CDT 守护已启动] -> {"code":200,...}          ← 推送链路通
 bw_month(init)=NN.NNNNGB (计费侧主流量)
 push[CDT 流量达阈值（1 GB）] -> {"code":200,...}   ← 阈值告警发得出去
 THRESHOLD HIT eff=NN.NNNG -> STOP
-（演练**不出现** tagged / halted=1 两行 —— 那三处写入被 DRY_RUN 挡着）
+DRY_RUN 模式：跳过 tag_halted（不打真实停机锁）
+oss halted=0 written BEFORE stop          ← ⚠️ 必须是 0，写 1 就是谎
 DRY_RUN 预检通过（DryRunOperation），实例未停 —— 链路可达、身份有效、权限齐备
 ```
+
+> 🔴 **看这两行的「值」，不要只看有没有这行**：
+> 演练里应当出现 **`跳过 tag_halted`** 与 **`oss halted=0`**。
+> 若看到 `tagged cdt-halted-month=…` 或 `oss halted=1` ——
+> 说明 `DRY_RUN` 的挡板被改坏了，**演练已经污染了真实停机判据**，要立刻处理。
+> （这两条日志曾经就是在演练下说谎的：上面那句「跳过」没打、下面那句硬编码 1。
+> 现在它们按实际值输出 —— 判据是「**日志说的与代码做的必须一致**」。）
 
 **这一条日志把整条链路的每一环都验到了**：凭据 → 身份自识别 → 混合口径 → 推送 →
 阈值命中 → 打标签 → OSS 写入 → **停机预检通过**。而**实例始终保持 Running**。
