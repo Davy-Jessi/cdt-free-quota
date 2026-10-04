@@ -185,6 +185,25 @@ cp /root/cdtguard.py.new /root/cdtguard.py && rc-service cdtguard restart
 
 **ECS 侧：一条命令替换 + 校验 + 重启**（在实例上以 root 执行）：
 
+> 🔴⚠️ **先看这段再抄下面的命令：线上文件可能有两种形态，而只改一种会「看起来成功」。**
+>
+> 有些部署把凭据放在**单独一行**的模块级常量里，再由 `PUSH_TOKEN` 引用它
+> （常量名各家不同，形如 `_EMBED_<名字>`）：
+>
+> ```
+> _EMBED_<常量名> = '<32 位十六进制>'
+> PUSH_TOKEN = _EMBED_<常量名>
+> ```
+>
+> 这种形态下，只替换 `PUSH_TOKEN = …` 那一行会：
+> · 断言照样命中 1 次（**通过**）；
+> · `grep -c '<YOUR_'` 照样是 0（**看起来干净**）；
+> · 而**旧 token 仍然明文留在文件里**，没有任何一步会告诉你。
+>
+> 所以下面的脚本**同时处理两种形态**，并在替换后**回读确认旧值真的没了** ——
+> 判据是「文件里不再出现旧 token」，而不是「grep 占位符是 0」。
+> （本仓库在别处栽过同一个坑：**「看起来通过」和「确实通过」是两件事**。）
+
 ```sh
 cd /root
 cp -p cdtguard.py cdtguard.py.bak.$(date +%Y%m%d-%H%M%S)   # 先备份
@@ -197,13 +216,40 @@ tok = sys.argv[1]
 assert re.fullmatch(r"[0-9a-fA-F]{32}", tok), "token 形态不对（pushplus 是 32 位十六进制）"
 p = "/root/cdtguard.py"
 s = io.open(p, encoding="utf-8").read()
-# 行首锚定：只改模块级那一行，不会碰注释与函数体里的引用
-new, n = re.subn(r'^PUSH_TOKEN = .*$',
-                 'PUSH_TOKEN = os.environ.get("PUSH_TOKEN", "%s")' % tok,
-                 s, count=1, flags=re.M)
-assert n == 1, "没找到唯一的 PUSH_TOKEN 赋值行（命中 %d 次）—— 别用 sed，先人工看一眼" % n
-io.open(p, "w", encoding="utf-8", newline="").write(new)
-print("OK 已替换")
+
+# 先记下「旧值」——用来在末尾证明它真的被清掉了。
+# 两种形态都取：单行字面量，以及被引用的 _EMBED_* 常量。
+old = set(re.findall(r"^_EMBED_[A-Z_]*PUSH[A-Z_]*\s*=\s*['\"]([0-9a-fA-F]{32})['\"]",
+                     s, flags=re.M))
+m0 = re.search(r"^PUSH_TOKEN\s*=\s*['\"]([0-9a-fA-F]{32})['\"]", s, flags=re.M)
+if m0:
+    old.add(m0.group(1))
+
+# ① 单行字面量形态
+s, n1 = re.subn(r"^PUSH_TOKEN\s*=\s*['\"][0-9a-fA-F]{32}['\"].*$",
+                'PUSH_TOKEN = os.environ.get("PUSH_TOKEN", "%s")' % tok,
+                s, count=1, flags=re.M)
+# ② 被引用的常量形态（任何 `_EMBED_…PUSH…` 名字，不假设具体叫什么）
+s, n2 = re.subn(r"^(_EMBED_[A-Z_]*PUSH[A-Z_]*\s*=\s*)['\"][0-9a-fA-F]{32}['\"]",
+                lambda m: m.group(1) + '"%s"' % tok,
+                s, count=1, flags=re.M)
+# ③ PUSH_TOKEN 直接引用常量（把默认值也钉成新 token，防止常量被删后回落成旧的）
+s, n3 = re.subn(r"^PUSH_TOKEN\s*=\s*_EMBED_[A-Z_]*PUSH[A-Z_]*\s*$",
+                'PUSH_TOKEN = os.environ.get("PUSH_TOKEN", "%s")' % tok,
+                s, count=1, flags=re.M)
+
+assert (n1 + n2 + n3) >= 1, (
+    "一处都没替换成功。别用 sed —— 先人工看一眼这一行的实际形态：\n  "
+    + "\n  ".join(l for l in s.splitlines() if "PUSH_TOKEN" in l and "=" in l))
+io.open(p, "w", encoding="utf-8", newline="").write(s)
+
+# 回读校验：判据是「旧值不再出现」，不是「占位符为 0」
+after = io.open(p, encoding="utf-8").read()
+leftover = sorted(t for t in old if t in after)
+assert not leftover, (
+    "旧 token 仍留在文件里（%d 处）—— 它可能出现在上面没覆盖到的形态里。\n"
+    "  用 grep -n '<旧token 前 6 位>' 找出来，手工处理。" % len(leftover))
+print("OK 已替换；旧值已从文件中消失（形态命中 %d/%d/%d）" % (n1, n2, n3))
 PY
 
 python3 -m py_compile cdtguard.py && echo COMPILE_OK     # 语法不过就别重启
@@ -212,6 +258,10 @@ rc-service cdtguard restart
 sleep 3 && tail -5 /var/log/cdtguard.log                  # 看有没有 push[...] -> {"code":200}
 unset TOK
 ```
+
+> ⚠️ **上面这段是「两种形态都处理」的写法，但它同样没有在**所有**部署形态上实测过。**
+> 真正常驻的判据是最后那条**回读断言**：不管你线上是哪种写法，
+> 「旧值必须从文件里消失」这个结论都成立，而且它做不到时会**报错**而不是静默通过。
 
 > 🔴 **验证只看一个信号：日志里 `push[CDT 守护已启动] -> {"code":200,...}`。**
 > 守护**每次启动都会推一条**（`main()` 开头那次 `rpt("CDT 守护已启动", …)`），
