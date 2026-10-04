@@ -94,7 +94,7 @@ def main():
     if m:
         ver = m.group(1)
 
-    print("== 1/2 正常状态必须判通过 ==")
+    print("== 1/3 正常状态必须判通过 ==")
     v = good_view()
     v["ver"] = ver
     f = vd.compare(inv, v)
@@ -102,7 +102,7 @@ def main():
 
     # ── 逐条反向用例：每个判据都要能被触发 ────────────────────────────
     print()
-    print("== 2/2 每条判据的反向用例（必须报出对应那一条）==")
+    print("== 2/3 每条判据的反向用例（必须报出对应那一条）==")
 
     cases = []
 
@@ -200,6 +200,18 @@ def main():
     v["ver_skipped"] = True
     cases_allow = [("ver 显式跳过（--skip-ver）→ 允许通过", v)]
 
+    # ⑩ **一个「多传了键」的部署必须放行。**
+    #    🔴 这条来自一次真实的自我矛盾：`inventory.json` 曾把 `TZ` 列为必需，
+    #       而 provision §5.1 明确写着「别加 TZ —— 代码里没有地方读它」。
+    #       后果是：**照文档建出来的部署（11 个键）会被 verify-deploy 判红**
+    #       —— 读者因为**正确地**省略了一个无用键而受罚。
+    #       判据是「线上 ⊇ 声明」，所以多传不算错。
+    #    ⚠️ 这条和上面那些「必须报红」的用例同等重要：**假阳性也会毁掉闸门** ——
+    #       一个会无故报红的验证器，人只会学会忽略它。
+    v = good_view(); v["ver"] = ver
+    v["env_keys"] = set(v["env_keys"]) | {"TZ", "SOME_EXTRA_KEY"}
+    cases_allow.append(("多传了键（线上 ⊇ 清单）→ 允许通过", v))
+
     ok = True
     for desc, view, want_sub in cases:
         f = vd.compare(inv, view)
@@ -224,13 +236,38 @@ def main():
     ok = ok and len(cases) >= 13
 
     print()
+    print("== 3/3 清单与文档承诺的键集必须一致 ==")
+    # 🔴 这条直接防上一节那个自我矛盾复发：
+    #    `inventory.json` 的 requiredEnv 是从**文档**（provision §5.1 的
+    #    CreateFunction body）来的。若清单里多出一个文档没让读者填的键，
+    #    照文档建出来的部署就会被 verify-deploy 判红。
+    #    ⚠️ 判据要**从文档里抽**，不能从清单里反推 —— 后者是自证。
+    import re as _re
+    prov = (ROOT / "scripts/provision/README.md").read_text(encoding="utf-8")
+    # 抓 CreateFunction 那段 body 里的 "KEY": 形态
+    body_keys = set()
+    for m in _re.finditer(r'"environmentVariables"\s*:\s*\{(.*?)\}', prov, _re.S):
+        body_keys |= set(_re.findall(r'"([A-Z][A-Z0-9_]+)"\s*:', m.group(1)))
+    declared = set(inv["fc"]["requiredEnv"])
+    check("从 provision §5.1 的 body 里抽到了键（>0）", len(body_keys) > 0,
+          "实际抽到 %d 个" % len(body_keys))
+    extra = sorted(declared - body_keys)
+    check("清单里的 requiredEnv 没有文档没承诺的键", not extra,
+          "多出（照文档建会缺这些）: %s" % extra)
+    missing = sorted(body_keys - declared)
+    check("文档承诺的键都在清单里", not missing,
+          "清单漏了（线上缺了不会报）: %s" % missing)
+    ok = ok and len(body_keys) > 0 and not extra and not missing
+
+    print()
     print("通过 %d，失败 %d" % (len(PASS), len(FAIL)))
     if FAIL:
-        print("!! verify-deploy.py 的比对存在**假通过**分支 ——")
-        print("   那意味着「以为有验证、其实没有」，比没有验证更糟。")
+        print("!! verify-deploy.py 的比对存在**假通过**或**假报红**分支 ——")
+        print("   前者意味着「以为有验证、其实没有」，后者会让人学会忽略闸门。")
         return 1
     return 0
 
 
 if __name__ == "__main__":
     sys.exit(main())
+

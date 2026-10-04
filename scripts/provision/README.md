@@ -22,13 +22,13 @@
 | `VPC_ID` | §4.1 `CreateVpc` 的返回 | 用 `grep -o '"VpcId":"[^"]*"'` 回读 |
 | `VSWITCH_ID` | §4.2 `CreateVSwitch` 的返回 | 同理回读 |
 | `SG` | §4.3 已示范回读 | |
-| `IMAGE_ID` | §2 `import-image.sh` 的输出 | |
+| `IMAGE_ID` | 依赖表第 **2** 行 `import-image.sh` 的输出 | |
 | `INSTANCE_ID` | §4.5 `RunInstances` 的返回 | `.env.example` 里叫 `ECS_INSTANCE_ID` |
 | `INST_NAME` | 你自己取（**不要用个人信息**） | `.env.example` 里叫 `ECS_NAME`。**只给 `--InstanceName` 用** |
 | `HOSTNAME_SAFE` | 你自己取，**必须是合规主机名** | ⚠️ **与 `INST_NAME` 分开取**。主机名只允许字母/数字/连字符，不能有下划线和点。见 §4.5 表里 `--HostName` 那行 |
 | `EIP_ID` | §4.6 `AllocateEipAddress` 的返回（`AllocationId`） | |
 | `EIP` | 同上返回里的 `EipAddress` | **与 `EIP_ID` 是两个不同的值** |
-| `CBWP_ID` | §4b `create-cbwp.sh` 的输出 | 它同时要填进 `cdtguard.py` 的 `BW_ID` |
+| `CBWP_ID` | 依赖表第 **4b** 行 `create-cbwp.sh` 的输出 | 它同时要填进 `cdtguard.py` 的 `BW_ID` |
 | `OSS_BUCKET` | 你自己定（**全局唯一、别嵌账号 UID**） | 要填进 `cdtguard.py` 与 `policies/` |
 
 > ⚠️ **次序坑**：`0a` 的 RAM 策略里嵌了 `$OSS_BUCKET`（§3.1），比 `1c` 建桶**更早** ——
@@ -282,7 +282,7 @@ echo "$INSTANCE_ID"
 
 | 参数 | 说明 |
 |---|---|
-| `--ImageId` | 必须是 §2 建的自定义镜像。**公共镜像都 ≥20 GB，而这里系统盘只要 1 GB** ⇒ 用公共镜像会报 `InvalidSystemDiskSize.LessThanImageSize` |
+| `--ImageId` | 必须是依赖表第 **2** 行建出来的自定义镜像。**公共镜像都 ≥20 GB，而这里系统盘只要 1 GB** ⇒ 用公共镜像会报 `InvalidSystemDiskSize.LessThanImageSize` |
 | `--InstanceType` | 🔴 **e 系列的型号名要把内存那一位读对。** 命名是 `<vCPU>:<GiB>` 的配比 —— 本方案用 `ecs.e-c1m1.large`（**2 vCPU / 2 GiB**）。⚠️ 别顺手换成 `ecs.e-c4m1.large`：它是 **1:4** 配比 ⇒ 2 vCPU 只有 **0.5 GiB** 内存，而本方案要在这台机器上同时跑**守护 + 代理**。同系列可选：`c1m1` 2 GiB / `c1m2` 4 GiB / `c1m4` 8 GiB。**改规格前先确认内存那一列**（`aliyun ecs DescribeInstanceTypes --RegionId "$REGION" --InstanceTypes.1 <型号>` 看 `MemorySize`） |
 | `--SpotStrategy SpotAsPriceGo` | 抢占式按市场价格自动出价 = 成本最低。⚠️ 代价是随时可能被回收 —— 这正是 FC 兜底存在的原因 |
 | `--SpotDuration 0` | 抢占式保留时长。**只支持 0 或 1**：`1` = 保证创建后 1 小时不被释放；`0` = 不保证运行时长，系统实时比较出价/库存决定回收。本方案要 7×24 常驻，1 小时保护没有意义，故取 `0` |
@@ -417,13 +417,21 @@ aliyun fc CreateFunction   --endpoint "$ACCOUNT_UID.$REGION.fc.aliyuncs.com"   -
 （另有 5 个有默认值的可选键：`ECS_NAME` `EIP` `ZONE` `TRAFFIC_THRESHOLD_GB` `OSS_ENDPOINT`）
 
 > ⚠️ 别顺手加 `TZ` —— **FC 代码里没有任何地方读它**（`index.js` 全文中 `process.env.TZ` 命中数为 0）。
-> 加了不生效，只会让下一个人以为时区可控。FC 的时间判定走的是 `REGION_ID`。
+> 加了不生效，只会让下一个人以为时区可控。FC 的时间判定走的是
+> [`../fc-keeper/index.js`](../fc-keeper/index.js) 里手动算的 UTC+8
+> （`new Date(Date.now() + 8 * 3600 * 1000)`），**不是** `TZ`。
 >
 > ⚠️ **键数要按你**自己**那台函数去数，别照抄一个数字。** 本仓库不记录任何
 > 具体部署环境的键数或键值 —— 那属于「部署环境特有的选择」（见
-> [`../../docs/pre-commit-checklist.md`](../../docs/pre-commit-checklist.md) §6）。
+> [`../../docs/pre-commit-checklist.md`](../../docs/pre-commit-checklist.md)
+> **二、语义清单**，那里给了判据：*「这个值是部署环境特有的，还是任何读者都会有的？」*）。
 > 你可以加 `TZ` 之类的死配置，也可以不加；`deploy-fc.py` 都不会删它
 > （它是「Get 读回 → 原样合并 → 写回」，不硬编码清单），所以**以线上现状为准**。
+>
+> ⚠️ **而 `inventory.json` 的 `requiredEnv` 只声明上面那 11 个键** ——
+> 因为本仓库另一处（`scripts/verify-deploy.py`）要拿它去回读线上。
+> 若把「文档说别加」的 `TZ` 也列进去，**照文档建出来的部署会被判红**。
+> 判据是「线上 ⊇ 声明」，所以多传一个 `TZ` 不算错。
 
 ### 5.1.1 怎么确认线上跑的是哪一版 **【实测】**
 
