@@ -226,10 +226,26 @@ unset TOK
 所以用仓库里的脚本，它是「Get 读回 → 原样合并 → 写回」：
 
 ```sh
-python3 scripts/deploy-fc.py scripts/fc-keeper/index.js --dry   # 先预检：读回 12 个键、必需键齐全
+python3 scripts/deploy-fc.py scripts/fc-keeper/index.js --dry   # 先预检：读回现有键、逐个复核、不写
 # 改本地环境里的 PUSH_TOKEN，或直接改 FC 控制台里的那个键，然后正式部署：
-python3 scripts/deploy-fc.py scripts/fc-keeper/index.js         # 部署后会自动调用一次并断言 ver
+python3 scripts/deploy-fc.py scripts/fc-keeper/index.js
 ```
+
+> ⚠️ **键数按你自己那台函数去数，别照抄一个数字** —— 本仓库不记录任何具体部署环境的
+> 键数或键值（见 [`scripts/provision/README.md`](scripts/provision/README.md) §5.1）。
+> `--dry` 会把它实际读回来的键打印出来，以那个为准。
+>
+> 🔴 **部署后断言有两个前提，缺一个就等于「没校验」**：
+> 1. **实例必须是 Running。** 不是 Running 时脚本**不会**调用函数（避免触发
+>    `StartInstance` 副作用把本该停机的实例拉起来）—— 这种情况下它现在会**按失败退出**，
+>    而不是假装成功。确实接受不校验时才加 `--allow-unverified`。
+> 2. **探针必须真的走到存活巡检分支。** 只断言 `ver` 是不够的：那只能证明
+>    「哪一版被加载」，证明不了「那一版能跑」。脚本现在会**额外再打一枪**
+>    带 `triggerTime` + `payload={"liveness":1}` 的探针，专门验那条分支没抛错 ——
+>    因为它是「护闸已死」唯一的外部观测手段，而它坏掉时是**静默**的。
+>
+> 📌 这两条不是理论：仓库真在存活巡检分支上栽过一次 ReferenceError，
+> 而当时的部署断言**照样报「通过」**。
 
 > ⚠️ **FC 侧的 `PUSH_TOKEN` 缺失 = 函数直接抛错拒绝启动**（`requireEnv()`），
 > 不像 ECS 侧那样能降级。所以改这一侧时**别把键删了**，只换值。

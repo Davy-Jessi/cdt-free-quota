@@ -1,5 +1,5 @@
 # 部署 cdt-keeper 到函数计算 FC 3.0。
-#   用法: python3 deploy-fc.py <index.js 路径> [--dry]
+#   用法: python3 deploy-fc.py <index.js 路径> [--dry] [--allow-unverified]
 #
 # 为什么需要这个脚本（而不是控制台点一下或直接调 UpdateFunction）：
 #
@@ -42,7 +42,7 @@ FN = os.environ.get("FC_FUNCTION_NAME", "cdt-keeper")
 REQUIRED_ENV = ["ALIYUN_AK", "ALIYUN_SK", "ECS_INSTANCE_ID", "OSS_BUCKET", "PUSH_TOKEN", "REGION_ID"]
 
 if len(sys.argv) < 2:
-    sys.exit("用法: python3 deploy-fc.py <index.js 路径> [--dry]")
+    sys.exit("用法: python3 deploy-fc.py <index.js 路径> [--dry] [--allow-unverified]")
 js_path = sys.argv[1]
 dry = "--dry" in sys.argv
 src = open(js_path, "rb").read()
@@ -139,15 +139,41 @@ if not _ins:
     sys.exit(0)
 st = _ins[0].get("Status")
 print("实例当前状态: %s" % st)
+# ⚠️⚠️ 实例不是 Running 时**不能悄悄 exit 0** —— 那等于「部署校验通过」但实际
+#     一次校验都没做。这恰恰是 v3 那个 bug 能溜过去的同类问题：
+#     报告成功，而成功不成立。
+#     两种选择都给：显式加 --allow-unverified 表示「我知道这次没校验」。
+ALLOW_UNVERIFIED = "--allow-unverified" in sys.argv
 if st != "Running":
-    print("⚠ 实例不是 Running —— 跳过调用校验，避免触发 StartInstance 副作用")
-    sys.exit(0)
+    print("")
+    print("✖ 实例不是 Running（当前 %s）—— **无法做调用校验**。" % st)
+    print("  为什么跳过：直接调用会触发 StartInstance 副作用，")
+    print("              可能把一台本该停机的实例拉起来继续烧流量。")
+    print("")
+    if ALLOW_UNVERIFIED:
+        print("  已指定 --allow-unverified ⇒ 接受「本次未校验」并按成功退出。")
+        print("  ⚠️ 这意味着：**代码是否真的部署上去了，本次没有被验证。**")
+        sys.exit(0)
+    print("  但**不校验 ≠ 校验通过**。所以这里按失败退出。")
+    print("  若你确实接受不校验：加 --allow-unverified 重跑。")
+    sys.exit(1)
 
 # ── 6) 调用并断言 ver（热实例可能仍跑旧码，故重试）──────────────────
+# ⚠️ 探针的 payload 决定了它**走到哪条分支** —— 这很关键：
+#    旧探针是 `{"probe": "deploy-verify"}`，没有 `triggerTime`，
+#    于是 evIsTimer=false、source='event'，**永远不会进入 isLiveness 分支**。
+#    实测：那个探针在 v3（有 ReferenceError 的那版）上照样返回 ver=v3 并判「通过」。
+#    也就是说：**它只证明「哪一版被加载」，不证明「那一版能跑」。**
+#    现在同时发一个带 triggerTime + payload={"liveness":1} 的探针，
+#    让存活巡检那条最容易坏的分支也真的被执行一次。
+VER_PROBE = {"probe": "deploy-verify"}
+LIVENESS_PROBE = {"triggerTime": "2026-01-01T00:00:00Z",
+                  "triggerName": "guard-liveness-8min",
+                  "payload": json.dumps({"liveness": 1})}
 ok = False
 for attempt in range(1, 6):
     resp = c.invoke_function(FN, fc.InvokeFunctionRequest(
-        body=json.dumps({"probe": "deploy-verify", "attempt": attempt})))
+        body=json.dumps(VER_PROBE)))
     b = resp.body
     if isinstance(b, str):
         raw = b
@@ -166,6 +192,35 @@ for attempt in range(1, 6):
         break
     time.sleep(4)
 
+# ── 6.5) 再打一次「存活巡检形态」的探针：验那条分支真的能跑 ──────────
+# 判据：**只要没有 error 字段**就算过（各场景的 action 取决于当时的 OSS 状态，
+#       部署期不该假定它是什么）；有 error 就说明那条分支抛了。
+if ok:
+    resp2 = c.invoke_function(FN, fc.InvokeFunctionRequest(
+        body=json.dumps(LIVENESS_PROBE)))
+    b2 = resp2.body
+    if isinstance(b2, str):
+        raw2 = b2
+    elif hasattr(b2, "read"):
+        raw2 = b2.read().decode()
+    else:
+        raw2 = b2.decode()
+    try:
+        got2 = json.loads(raw2)
+    except Exception:
+        got2 = {}
+    print("  存活巡检探针: action=%s evIsLiveness=%s"
+          % (got2.get("action"), got2.get("evIsLiveness")))
+    if got2.get("error"):
+        print("  ✖ 存活巡检分支抛错：%s" % got2.get("error"))
+        print("     ⚠️ 这条分支是「护闸已死」唯一的外部观测手段，")
+        print("        它坏掉时是**静默**的（被外层 catch 兜住），必须当成失败。")
+        ok = False
+    elif not got2.get("evIsLiveness"):
+        print("  ✖ 探针没有进入存活巡检分支（evIsLiveness 非真）——")
+        print("     说明事件形状与线上定时器不一致，这次校验没覆盖到那条分支。")
+        ok = False
+
 print()
-print("部署校验: %s" % ("✔ 通过（新代码已在跑）" if ok else "✖ 失败（仍在跑旧代码？）"))
+print("部署校验: %s" % ("✔ 通过（新代码已在跑，且存活巡检分支执行无错）" if ok else "✖ 失败（仍在跑旧代码？）"))
 sys.exit(0 if ok else 1)

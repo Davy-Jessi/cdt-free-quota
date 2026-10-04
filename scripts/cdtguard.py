@@ -102,7 +102,11 @@
          FC 的 `ECS_INSTANCE_ID` 环境变量是人工维护的，重建后必须更新。
       ⚠️ OSS 的 halted 字段**不是**可选审计，它是 Tag 打标失败时的唯一兜底
          （FC 的判据是 tagHalted || ossHalted）。
-      ⚠️⚠️ FC 侧读 halted **必须绑定月份**（第 29 条），否则跨月自锁。
+      ⚠️⚠️ FC 侧读 halted **必须绑定月份**（本文件第 7 条；FC 侧对应实现
+         见 `scripts/fc-keeper/index.js` 里的 `ossHalted = !!st.halted && st.month === cur`），
+         否则跨月自锁。
+         📌 **注意编号有两套**：本文件 docstring 用的是**本文件自己的** 1~29 条编号；
+         `docs/pitfalls.md` 另有一套 1~29。引用「第 N 条」时务必说清是哪一套。
 
 8. ⚠️ 停机前必须补写一次 OSS halted=1
       OSS 平时每 60 秒才写一次，达阈值那一刻它的 halted 仍是 0（上次写时 eff 还
@@ -250,8 +254,12 @@
 25. ⚠️ 推送失败必须被计数并透出
       `notify()` 把异常全吞了，推送失败只落一行日志 —— 而整条告警链是
       **单点依赖 pushplus**。加模块级 `PUSH_FAILS[0]` 连续失败计数，
-      并写进 OSS 的 `push_fail_streak` 字段，FC 的存活巡检会读它。
-      ✅ FC 侧已对齐：`PUSH_TOKEN` 缺失时 `requireEnv()` 直接抛错拒绝启动，
+      并写进 OSS 的 `push_fail_streak` 字段。
+      ⚠️ **诚实说明它的边界**：FC 的存活巡检会把这个字段**读进返回体**
+      （`out.ossPushFailStreak`），但**目前没有任何地方拿它触发告警** ——
+      也就是说它现在只是**审计透出**，不是「推送断了会有人告诉你」。
+      要变成真告警，得在 FC 的 liveness 分支上加一条 `streak >= N` 的判断。
+      ✅ FC 侧已对齐的另一半：`PUSH_TOKEN` 缺失时 `requireEnv()` 直接抛错拒绝启动，
          不再静默降级成「护闸在跑、告警永不发」。
 
 26. ⚠️ spot 抢占预警改用 `OperationLocks.LockReason`

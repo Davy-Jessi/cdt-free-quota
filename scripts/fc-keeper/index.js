@@ -116,7 +116,11 @@ const OSS_ENDPOINT = process.env.OSS_ENDPOINT || 'oss-cn-hongkong.aliyuncs.com';
 //    ⚠️ **递增是硬要求**：`deploy-fc.py` 的部署后断言是「运行时自报的 ver == 源码里的 ver」。
 //       改了代码却不递增，这个断言**必然通过** —— 却证明不了新代码在跑（热实例问题）。
 //       v3：存活巡检分支不再重复读 OSS（复用已读到的 `st`）。
-const VER = 'v4-liveness-scope-fix';
+//       v4：修 v3 引入的 ReferenceError（`st` 的块作用域跨不过 try）。
+//       v5：修一个**实测确认过的 fail-open** —— OSS 对象读到了但没有可用 `ts` 时，
+//           失联判据被算成 0、「护闸疑似失联」永不触发，且全程静默。
+//           现在走独立的 `error-oss-ts-missing` 响铃分支。
+const VER = 'v5-oss-ts-missing';
 const STATE_KEY = 'cdtguard/state.json';
 const PUSH_TOKEN = requireEnv('PUSH_TOKEN');
 const HALT_TAG = 'cdt-halted-month';
@@ -272,6 +276,9 @@ async function decide(source, evKeys, evResId, isPreempt, isLiveness) {
     //    下面这段拿到的 stTsMs 决定「护闸疑似失联」告警能不能触发；
     //    没有 OSS 桶时 stTsMs=0 ⇒ 告警静默失效。（决策本身仍只依据实例状态与 Tag。）
     let effGb = null, ossHalted = false, stTsMs = 0, ossUnreadable = false;
+    // ⚠️ 与 ossUnreadable 分开：那种情况读取是**成功**的，只是对象里没有可用 ts。
+    //    文案必须能区分这两件事，否则告警自己就在说谎。
+    let ossTsMissing = false;
     // ⚠️⚠️ `st` 必须在**内层 try 之外**声明。
     //    写成 `const st = ...` 放 try 里，则块级作用域只到那个 try 为止；
     //    而下面的 `isLiveness` 分支（同一个函数、但已出了那个块）还要用它
@@ -305,6 +312,27 @@ async function decide(source, evKeys, evResId, isPreempt, isLiveness) {
         out.ossMonth = st.month || null;
         out.ossTs = st.ts || null;
         stTsMs = Date.parse(st.ts || '') || 0;
+        // 🔴🔴 **对象读到了、但拿不到可用时间戳 ⇒ 同样必须响铃。**
+        //    这是一个**实测确认过的 fail-open**：`staleMs` 的定义是
+        //        const staleMs = stTsMs ? (Date.now() - stTsMs) : 0;
+        //    于是 stTsMs=0 时 staleMs 恒为 0，**「护闸疑似失联」永远不触发**，
+        //    而 ossUnreadable 是 false（读取本身成功了）—— 全程静默。
+        //
+        //    可达性不是理论问题：**诱饵对象的形状就是没有 ts**
+        //    （cdtguard.py 里那个 `{"month":"<上月>","acc":<巨大>}`），
+        //    而那份文档写明「实测出现过 FC 运行读到诱饵的情况」。
+        //    也就是说这个分支在真实环境里**被触发过** —— 只是当时没人发现它不响铃。
+        //
+        //    判据：**「时间戳不可得」与「读不到对象」对失联检测是同一件事** ——
+        //    两者都回答不了「护闸还在写吗」。所以两者都必须响铃。
+        //    （这也是 fc-keeper 规格里那条
+        //      「状态对象没有可用时间戳 → 该告警 SHALL NOT 被静默跳过」的要求。）
+        //
+        //    ⚠️ 用**独立标志**而不是复用 ossUnreadable：那种情况下读取是成功的，
+        //    文案必须如实说「读到了、但里面没有可用时间戳」，否则告警自己在说谎。
+        if (!stTsMs) {
+          ossTsMissing = true;
+        }
       }
     } catch (e) { out.ossErr = String(e).slice(0, 80); ossUnreadable = !!OSS_BUCKET; }
     const halted = tagHalted || ossHalted;   // 任一来源说已停机，就不拉起
@@ -345,6 +373,7 @@ async function decide(source, evKeys, evResId, isPreempt, isLiveness) {
       //    仍显示 started，但零计量、零写入、零停机。
       const staleMs = stTsMs ? (Date.now() - stTsMs) : 0;
       out.ossUnreadable = ossUnreadable;
+      out.ossTsMissing = ossTsMissing;
       if (ossUnreadable) {
         // ⚠️ 读不到 OSS 不能"当作没有记录" —— 那样失联检测会静默失效。
         //    OSS_BUCKET 已配置却读不到，本身就是需要响铃的故障。
@@ -357,6 +386,21 @@ async function decide(source, evKeys, evResId, isPreempt, isLiveness) {
             '护闸的停机逻辑不受影响（停机锁 Tag 仍是权威判据）。' + NL +
             '【OSS 错误】' + (out.ossErr || '(无)') + NL +
             '【OSS 桶】' + OSS_BUCKET));
+      } else if (ossTsMissing) {
+        // 🔴 与上面那条刻意分开：**读取是成功的**，只是对象里没有可用的时间戳。
+        //    这种情况下 staleMs 会被算成 0、失联告警永远不响 —— 是个 fail-open。
+        //    文案必须如实说「读到了，但里面没有时间戳」，不能冒充「读不到」。
+        //    动作名也用独立的 —— 便于从 last-run.json / 日志里区分这两种故障。
+        out.action = 'error-oss-ts-missing';
+        out.push = await push('！！ CDT FC：OSS 对象里没有可用时间戳',
+          bodyText(s, effGb, halted, tagVal,
+            '【动作】未做任何操作' + NL +
+            '【说明】状态对象**读到了**，但 `ts` 字段缺失或无法解析。' + NL +
+            '这会让「护闸疑似失联」的判据失效（失联时长会被算成 0）——' + NL +
+            '而它是「护闸已死」唯一的外部观测手段。故本判据改为响铃。' + NL +
+            '⚠️ 常见成因：对象是被手工写入的**诱饵**，或写入被中途截断。' + NL +
+            '【实际读到】' + JSON.stringify(out.ossTs) + NL +
+            '【对象里的字段】' + Object.keys(st || {}).join(', ')));
       } else if (staleMs > STALE_MIN * 60 * 1000) {
         const mins = Math.round(staleMs / 60000);
         out.guardStaleMin = mins;

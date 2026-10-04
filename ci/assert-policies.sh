@@ -31,11 +31,11 @@ echo "  使用解释器: $PY"
 fail=0
 
 echo
-echo "== 1/5 策略高危 action 断言 =="
+echo "== 1/6 策略高危 action 断言 =="
 "$PY" ci/check-policies.py policies/cdtguard-runtime-policy.json || fail=1
 
 echo
-echo "== 2/5 基础卫生：常见凭据形态 =="
+echo "== 2/6 基础卫生：常见凭据形态 =="
 # 占位符形如 <YOUR_XXX>，不会命中下面这几条。
 #
 # ⚠️⚠️ **本步刻意不排除任何路径** —— 包括 ci/ 自己。
@@ -56,14 +56,14 @@ else
 fi
 
 echo
-echo "== 3/5 泄漏闸：形状 + 哈希黑名单 =="
+echo "== 3/6 泄漏闸：形状 + 哈希黑名单 =="
 # 这一步防的是「已清除的值回流」以及「第一次出现的凭据形状」。
 # ⚠️ 它只管形状与已知值 —— 「部署者特有的选择」类问题（用了哪个网络方案、哪家云、
 #    伪装成哪个域名）抓不到，发布前仍须按 docs/pre-commit-checklist.md 人读。
 "$PY" ci/check-disclosure.py . || fail=1
 
 echo
-echo "== 4/5 %-格式化：占位符与实参个数 =="
+echo "== 4/6 %-格式化：占位符与实参个数 =="
 # 这类不匹配**只在运行时炸**，而且往往炸在**告警路径**上
 # （「守护已启动」那条推送就在 main() 开头 —— 进程会启动 2 秒内死掉，
 #   而 supervise-daemon 无限重启它，rc-service 仍显示 started）。
@@ -71,7 +71,7 @@ echo "== 4/5 %-格式化：占位符与实参个数 =="
 "$PY" ci/check-format-args.py || fail=1
 
 echo
-echo "== 5/5 未定义名 / 定义了但从未被调用 =="
+echo "== 5/6 未定义名 / 定义了但从未被调用（Python）=="
 # ⚠️ 这一步以前**只**在部署脚本里跑（deploy-cdtguard.sh 把它 scp 到目标机再跑），
 #    于是仓库自身的 CI 从来不看它 —— README 却把「未定义名」列成 ci/ 的检查项之一。
 #    「本地能跑」和「每次跑」是两件事，见 .github/workflows/ci.yml 顶部那段。
@@ -96,6 +96,50 @@ if [ "$found" -eq 0 ]; then
   echo "     \`git ls-files\` 取不到文件列表）。这种情况下请改用 clone，"
   echo "     或手动跑：python3 ci/check-names.py <你的文件>"
   fail=1
+fi
+
+echo
+echo "== 6/6 JS 语义：fc-keeper 的决策分支冒烟 =="
+# 🔴 **这一步是补一个真实踩过的盲区。**
+#    本仓库在 fc-keeper 上栽过两次，**两次 CI 全绿**：
+#      1) 块作用域 ReferenceError（`st` 声明在 try 内、try 外引用）——
+#         `node --check` **查不出**（语法合法），被外层 catch 吞掉 ⇒ 静默退化。
+#      2) OSS 对象读到但没有可用 `ts` ⇒ 失联判据被算成 0 ⇒ 告警永不触发。
+#    两次都只有「真的执行到那条分支」才会暴露。所以这一步**桩掉外部 IO、
+#    把每个决策分支真的跑一遍并断言 action** —— 判据是 action，
+#    不是「没抛异常」（bug 1 恰恰会被 catch 转换成不抛异常）。
+#
+#    ⚠️ 为什么单列一步而不是塞进 5/6：它需要 node，而 5/6 只需要 python。
+#       缺 node 时**必须判失败**，不能静默跳过 —— 否则闸门形同不存在。
+#
+#    ⚠️ node 的查找要兼容 Windows 的 Git Bash / WSL：那边装的常是 `node.exe`，
+#       而 `command -v node` 在 bash 里**找不到它**（实测：文件在
+#       `/mnt/c/Program Files/nodejs/node.exe`，但 `command -v node` 报 not found）。
+#       所以逐个试 node / node.exe，并且**要求它真的能打印版本**才算可用 ——
+#       与上面找 Python 用的是同一套判据（占位符可执行文件也会「找得到」）。
+NODE=""
+for c in node node.exe; do
+  if command -v "$c" >/dev/null 2>&1 && [ -n "$("$c" --version 2>/dev/null)" ]; then
+    NODE="$c"; break
+  fi
+done
+# Git Bash / WSL 兜底：直接试 Windows 的常见安装路径
+if [ -z "$NODE" ]; then
+  for p in "/mnt/c/Program Files/nodejs/node.exe" \
+           "/c/Program Files/nodejs/node.exe" \
+           "/c/Program Files (x86)/nodejs/node.exe"; do
+    if [ -x "$p" ] && [ -n "$("$p" --version 2>/dev/null)" ]; then NODE="$p"; break; fi
+  done
+fi
+
+if [ -z "$NODE" ]; then
+  echo "  X 找不到可用的 node —— 本步无法执行。"
+  echo "    fc-keeper 是唯一没有语义检查的代码文件，这一步是它唯一的闸。"
+  echo "    装 node 后重跑（见 docs/toolchain.md 第一节）。"
+  fail=1
+else
+  echo "  使用 node: $NODE ($("$NODE" --version 2>/dev/null))"
+  "$NODE" ci/smoke-fc-keeper.js || fail=1
 fi
 
 echo
