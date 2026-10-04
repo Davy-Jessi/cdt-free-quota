@@ -191,6 +191,15 @@ def main():
     v["ver_error"] = "connection reset"
     cases.append(("ver 读不到（不校验 ≠ 校验通过）", v, "无法回读 ver"))
 
+    # ⑨c ver **显式跳过** —— 必须放行（逃生口要能用），
+    #     但不能和「读到了且一致」混为一谈（结论里会单独提示）。
+    #     ⚠️ 这两条一起才说明「显式跳过」与「读失败」被分开了：
+    #        第一版把两者都记成 ver_error ⇒ 跳过也永远失败 ⇒ 参数等于没用，
+    #        人只会绕开整个脚本。**逃生口不能用 = 没有逃生口。**
+    v = good_view(); v["ver"] = None
+    v["ver_skipped"] = True
+    cases_allow = [("ver 显式跳过（--skip-ver）→ 允许通过", v)]
+
     ok = True
     for desc, view, want_sub in cases:
         f = vd.compare(inv, view)
@@ -199,6 +208,14 @@ def main():
         check("%s → 报出「%s」" % (desc, want_sub), hit,
               "实际: %s" % (got or "(无失败项 —— **假通过**)"))
         ok = ok and hit
+
+    # 必须**放行**的用例：逃生口要能用，否则人只会绕开整个脚本。
+    for desc, view in cases_allow:
+        f = vd.compare(inv, view)
+        got = fmt(f)
+        check("%s（不应有失败项）" % desc, not f,
+              "实际: %s" % got)
+        ok = ok and not f
 
     # 保险：至少要有这么多条反向用例，否则是「用例被删了」而不是「都过了」
     print()

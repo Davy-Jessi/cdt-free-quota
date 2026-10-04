@@ -3,6 +3,15 @@
 
     python3 scripts/verify-deploy.py            # 只读，不改任何东西
     python3 scripts/verify-deploy.py --quiet    # 进度静默；**失败照常打印**
+    python3 scripts/verify-deploy.py --skip-ver # 跳过 ver 回读（见下）
+
+⚠️ **`--skip-ver` 为什么存在**：回读 ver 需要**真的调用一次函数**，而那个
+   payload（无 triggerTime、无 liveness）走的是「事件型且非存活」那条路 ——
+   在实例**已停机且未被标记 halted** 时，它**会真的去 StartInstance**。
+   实例正常 Running 时这次调用是只读的。
+   所以：**实例已停机时，要么先跑 `--skip-ver`，要么接受它可能拉起实例。**
+   `--skip-ver` 会在结论里**大声说明「本次没验证代码版本」**，但放行其余各项 ——
+   逃生口必须能用，否则人只会绕开整个脚本；但也不能让跳过看起来像查过了。
 
 **为什么需要它（真实事故）。**
 
@@ -44,6 +53,13 @@ import re
 import sys
 
 QUIET = "--quiet" in sys.argv
+# ⚠️ `--skip-ver` 会跳过「回读 ver」那一步（它需要真的调用一次函数，
+#    而调用在实例已停机时**可能把它拉起来**）。
+#    跳过时把它记成 `ver_error` ⇒ compare() 判失败 ⇒ 退出码非 0。
+#    **这是刻意的**：要跳过就得明说，而不是让它静默通过。
+#    （与 deploy-fc.py 的 `--allow-unverified` 是同一套思路，只是那边要显式
+#      声明「我知道这次没校验」才放行，这里同名参数也保持一致的语义。）
+SKIP_VER = "--skip-ver" in sys.argv
 
 
 def say(msg):
@@ -199,6 +215,16 @@ def compare(decl, view):
                 })
 
     # ⑨ ver
+    #
+    # ⚠️⚠️ **要把三种情况分开，它们不是一回事：**
+    #      · 读到了且一致        → 通过
+    #      · **读失败**（网络/权限/超时）→ **判失败**。你并没有选择不校验，
+    #        是校验没做成 —— 那不叫通过。与 deploy-fc.py 里
+    #        「实例不是 Running 时拒绝悄悄 exit 0」是同一条理由。
+    #      · **显式 --skip-ver**  → 允许通过，但必须**大声**说出来。
+    #        这条只有用户主动指定才会走到（因为那次调用可能把已停机的实例拉起来）。
+    #        第一版把「显式跳过」也记成 ver_error ⇒ 永远失败 ⇒ 那个参数等于没用，
+    #        人只会绕开整个脚本。**逃生口必须是能用的**，否则等于没有。
     vs = fcdecl.get("verSource")
     expect = None
     if vs and (pathlib.Path(vs)).exists():
@@ -206,14 +232,14 @@ def compare(decl, view):
                       (pathlib.Path(vs)).read_text(encoding="utf-8"))
         expect = m.group(1) if m else None
     if expect:
-        if view.get("ver_error"):
-            # ⚠️ 「读不到」不等于「读到了且一致」。本仓库的 deploy-fc.py 在
-            #    实例不是 Running 时**拒绝**悄悄 exit 0，理由是同一条：
-            #    **不校验 ≠ 校验通过**。
+        if view.get("ver_skipped"):
+            pass          # 显式跳过：结论里会单独、大声地提示
+        elif view.get("ver_error"):
             fails.append({
                 "msg": "无法回读 ver：%s" % view["ver_error"],
                 "hint": ["不校验 ≠ 校验通过。所以这里算失败。",
-                         "若确实接受不校验，应当**显式**说明，而不是让它静默通过。"],
+                         "若你是因为实例已停机、不想冒拉起它的风险，",
+                         "请显式用 --skip-ver（它会大声说明这次没校验）。"],
             })
         elif view.get("ver") != expect:
             fails.append({
@@ -303,22 +329,44 @@ def main():
     say("  触发器: 线上 %d 个 —— %s" % (len(live), ", ".join(sorted(live))))
 
     # ── 回读 ver ───────────────────────────────────────────────────────
-    ver, ver_error = None, None
-    try:
-        resp = c.invoke_function(FN, fc.InvokeFunctionRequest(
-            body=json.dumps({"probe": "verify-deploy"})))
-        b = resp.body
-        if isinstance(b, str):
-            raw = b
-        elif hasattr(b, "read"):
-            raw = b.read().decode()
-        else:
-            raw = b.decode()
-        ver = json.loads(raw).get("ver")
-        say("  ver=%s" % ver)
-    except Exception as e:
-        ver_error = str(e)
-        say("  ⚠️ 调用失败：%s" % e)
+    # ⚠️⚠️ **这一次调用有副作用风险，说清楚。**
+    #    探针 payload 是 `{"probe":"verify-deploy"}`：没有 triggerTime ⇒ 不是 timer；
+    #    没有 liveness ⇒ 不是存活巡检。所以它走的是「事件型、且非存活」那条路 ——
+    #    在实例**已停机且未被标记 halted** 时，那条路会真的去 StartInstance。
+    #
+    #    为什么还是调用它：`ver` 是唯一能证明「线上跑的就是这份代码」的东西，
+    #    而本仓库正好栽过「以为部署成功、实际跑旧代码」。
+    #
+    #    但代价必须写明，否则就是让人在不知情的情况下把一台已停机的实例拉起来烧流量：
+    #      · 实例**正常 Running** 时：调用是只读的（走 noop-Running / liveness 分支）。
+    #      · 实例**已停机**时：**先跑 `--skip-ver`**，或接受它可能拉起实例。
+    #    `--skip-ver` 会把它记为「未校验」并**判失败**（不校验 ≠ 校验通过）——
+    #    这是刻意的：要跳过就得明说，而不是让它静默通过。
+    ver, ver_error, ver_skipped = None, None, False
+    if SKIP_VER:
+        ver_skipped = True
+        print("  ⚠️ 已跳过 ver 回读（--skip-ver）。")
+        print("     这次**没有**验证「线上跑的是不是这份代码」—— 结论里会再提示一次。")
+    else:
+        try:
+            resp = c.invoke_function(FN, fc.InvokeFunctionRequest(
+                body=json.dumps({"probe": "verify-deploy"})))
+            b = resp.body
+            if isinstance(b, str):
+                raw = b
+            elif hasattr(b, "read"):
+                raw = b.read().decode()
+            else:
+                raw = b.decode()
+            got = json.loads(raw)
+            ver = got.get("ver")
+            say("  ver=%s action=%s" % (ver, got.get("action")))
+            # 顺带把实例状态说出来 —— 它是判断「这次调用有没有副作用」的依据
+            if got.get("instStatus"):
+                say("  实例状态: %s" % got.get("instStatus"))
+        except Exception as e:
+            ver_error = str(e)
+            say("  ⚠️ 调用失败：%s" % e)
 
     view = {
         "runtime": cur.runtime,
@@ -327,6 +375,7 @@ def main():
         "triggers": live,
         "ver": ver,
         "ver_error": ver_error,
+        "ver_skipped": ver_skipped,
     }
 
     fails = compare(inv, view)
@@ -352,6 +401,13 @@ def main():
     print("✔ 线上状态与 inventory.json 一致（%d 个触发器、%d 个 env 键、ver=%s）"
           % (len(fcdecl.get("triggers") or []), len(fcdecl.get("requiredEnv") or []),
              ver or "?"))
+    if ver_skipped:
+        # ⚠️ 逃生口必须能用，但**不能让跳过的部分看起来像查过了**。
+        print()
+        print("⚠️ 但这次**跳过了一项**：ver 回读（--skip-ver）。")
+        print("   也就是说：「线上跑的是不是这份代码」**本次没有被验证**。")
+        print("   触发器 / env / runtime 那几项是**真的回读并比对过**的。")
+        return 0
     return 0
 
 
