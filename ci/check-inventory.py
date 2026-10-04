@@ -29,6 +29,7 @@
 import json
 import pathlib
 import re
+import subprocess
 import sys
 
 ROOT = pathlib.Path(".")
@@ -182,6 +183,31 @@ def _read_text(p):
     return p.read_text(encoding="utf-8")
 
 
+def git_tracked_md():
+    """**受跟踪的** .md 文件清单，走 `git ls-files`。
+
+    ⚠️ 用 git 而不是 `glob("**/*.md")`：后者会把 `openspec/`、`.claude/`
+       这类**开发过程产物**（已 gitignore、但仍在本地磁盘）也扫进来，
+       于是同一份文档在本地红、在 CI 绿 —— 而 CI 才是判据。
+    ⚠️ 也不能**写死文件名清单** —— 写死的那版漏了 docs/ 与 console/，
+       而「N 个触发器」这种计数恰好可以出现在任何一篇里。
+       漏掉一整类文件是不报错的：它只是**安静地少查**。
+    """
+    try:
+        out = subprocess.run(["git", "ls-files", "*.md"],
+                             cwd=str(ROOT), capture_output=True, text=True,
+                             check=True).stdout
+    except (OSError, subprocess.CalledProcessError):
+        # 不是 git 仓库（比如解压 zip 拿到的副本）时退回目录扫描 ——
+        # 但**明确说出来**，因为此时的覆盖面与 CI 不同。
+        print("  ⚠ 不是 git 仓库（或 git 不可用）—— 退回扫当前目录下的 .md")
+        return [str(p.relative_to(ROOT)).replace("\\", "/")
+                for p in sorted(ROOT.rglob("*.md"))
+                if not any(x in p.parts for x in (".git", "__pycache__",
+                                                  "openspec", ".claude"))]
+    return [x for x in out.splitlines() if x.strip()]
+
+
 # 让一句计数变成「历史/对比陈述」的词。
 #
 # ⚠️⚠️ **为什么需要这张表。** 第一版规则是「任何 `N 个触发器` 都要等于清单长度」，
@@ -316,11 +342,25 @@ def check_docs(doc):
     #    ⚠️ 这一半曾经**比 ② 弱**（漏了第三个模式，于是「N 个触发器」这种最常见
     #       的写法根本没被匹配，看起来通过其实什么都没查）。现在两边共用同一份
     #       `_count_claims` / `_wrong_claims` —— 两处规则不一致，就是下一块盲区。
-    for f in ("SKILL.md", "README.md"):
+    #
+    #    ⚠️⚠️ **范围也曾经是写死的两个文件**（只有 SKILL.md / README.md）。
+    #       那意味着 `docs/*.md`、`console/*.md` 里的同类计数**从来没人查** ——
+    #       而它们同样会让读者按错的数字去建资源。
+    #       「N 个触发器」这种说法可以出现在任何一篇文档里，所以这里改成
+    #       **扫全部受跟踪的 .md**，而不是维护一个迟早会漏的清单。
+    #       历史/对比陈述由 `_wrong_claims` 按句子排除（见上面的说明）。
+    md_files = sorted(git_tracked_md())
+    scanned = 0
+    for f in md_files:
+        if f == tbl_path:
+            continue          # 权威文件已在 ② 里查过，避免重复报
         t = _read_text(f)
         if t is None:
             continue
         claims = _count_claims(t)
+        if not claims:
+            continue
+        scanned += 1
         wrong = _wrong_claims(t, want)
         if wrong:
             print("  X %s 里的触发器计数与清单不符：" % f)
@@ -328,8 +368,9 @@ def check_docs(doc):
                 print("      :%d  %s = %d（清单 %d）" % (line, kind, num, want))
                 print("          %s" % sent)
             bad += 1
-        elif claims:
+        else:
             print("  OK %s 的 %d 处计数说法一致" % (f, len(claims)))
+    print("  （扫了 %d 篇受跟踪的 .md，其中 %d 篇含触发器计数）" % (len(md_files), scanned))
 
     # ④ **「N 个脚本」这类计数也要回读。**
     #    🔴 这一条来自一次**真实的、我自己犯的**错误：刚给 ci/ 加了两个脚本，

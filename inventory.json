@@ -89,9 +89,15 @@
   },
 
   "_docSources": [
-    "下列文件被 ci/check-inventory.py 当作「文档声称」的来源，逐条与上面比对：",
-    "  · scripts/provision/README.md  §5.3 的触发器表 —— 权威表",
-    "  · SKILL.md / README.md / docs/ —— 任何「一共 N 个触发器」的说法",
+    "⚠️ 这一段是**给人读的说明**，不是配置 —— ci/check-inventory.py 里的文件名是**写死**的。",
+    "   曾经这里写「下列文件被当作来源」，读起来像改这里就能加文件；实际改它没有任何效果。",
+    "   （同一个 bug：写下的声明没人回读。所以要么让说明与代码一致，要么改成真的可配。）",
+    "",
+    "检查器实际扫描的位置（写死在 check_docs 里）：",
+    "  · 权威表: docTriggerTable + docTriggerTableSection（下面两个字段）—— 必须列全触发器",
+    "  · 权威表所在文件的『N 个触发器』计数 —— 必须等于清单长度",
+    "  · SKILL.md / README.md 的同类计数 —— 同上",
+    "  · README.md 的『ci/ N 个脚本』计数 —— 从文件系统与 assert-policies.sh 回读",
     "对不上一律判红。**这正是当初漏掉 guard-liveness-8min 却没被发现的地方。**"
   ],
   "docTriggerTable": "scripts/provision/README.md",
