@@ -53,12 +53,16 @@
 ├── .gitignore                ← 忽略 .env / __pycache__ / .playwright-mcp / openspec / .claude 等
 ├── .env.example              ← 环境变量清单（**只列有 env 入口的键**；裸字面量常量见文件内「第一组补充」）
 ├── .pre-commit-config.yaml   ← 提交前凭据扫描（gitleaks + 真实凭据形态）
-├── ci/                       ← 静态断言（6 个脚本；其中 4 个由 assert-policies.sh 串起来）
-│   ├── assert-policies.sh    ← 入口：策略断言 + 凭据形态 + 泄漏闸 + %-格式化 + 未定义名
+├── inventory.json            ← **线上应付状态**的机器可读声明（触发器 / env 键 / runtime）
+├── ci/                       ← 静态断言（7 个脚本；其中 5 个由 assert-policies.sh 串起来）
+│   ├── assert-policies.sh    ← 入口：策略 + 凭据形态 + 泄漏闸 + %-格式化 + 未定义名 + JS 语义 + 部署事实
 │   ├── check-policies.py     ← 高危 action 既未放行、也被显式 Deny
 │   ├── check-disclosure.py   ← 泄漏闸：形状检查 + 哈希黑名单 + 代码位置占位符
 │   ├── check-format-args.py  ← %-格式化的占位符与实参个数
 │   ├── check-names.py        ← 未定义名 / 定义了但从未被调用（CI 与部署时都用）
+│   ├── check-inventory.py    ← 部署事实的**离线**一半：清单 ↔ 文档 ↔ 源码三方自洽
+│   ├── smoke-fc-keeper.js    ← fc-keeper 的决策分支冒烟（断言 action，不是「没抛异常」）
+│   ├── smoke-verify-deploy.py ← 证明 verify-deploy.py 的比对**真的会报警**（13 个反向用例）
 │   └── compare-code.py       ← 与未脱敏原件比对代码结构（**要你手上有原件，CI 跑不了**）
 ├── .github/workflows/ci.yml  ← 让上面那些断言在 push / PR 时自动跑
 ├── scripts/
@@ -179,6 +183,18 @@ sh ci/assert-policies.sh
 - [`docs/pre-commit-checklist.md`](docs/pre-commit-checklist.md) —— **必须人读的语义清单**。
   机械检查够不着**「这是部署环境特有的选择」**这一类：用了哪种网络方案、哪家云、
   挑了哪个域名、给哪些服务分流。它们没有固定形状，只能靠读懂内容。
+- [`ci/check-inventory.py`](ci/check-inventory.py) + [`scripts/verify-deploy.py`](scripts/verify-deploy.py)
+  —— **部署事实**这道闸，**分两半，别混为一谈**：
+  - `check-inventory.py`（进 CI，**离线**）：`inventory.json` ↔ 文档 ↔ 源码三方自洽。
+    CI 里没有云凭据，**它读不到线上** —— 三方都写对而线上依然错，是完全可能的。
+  - `verify-deploy.py`（**需要 AK/SK/UID**，部署时自动跑）：真的去线上逐一回读
+    触发器名字 / 类型 / cron / **启用状态** / payload、env 键、runtime、`ver`。
+  ⚠️ **为什么要有这道闸**：`provision/README.md` §5.3 把 3 个触发器都写对了、
+  还专门警告 `guard-liveness-8min`「别漏掉，它是唯一能在护闸悄悄死掉时告警的机制」，
+  而**线上只有 2 个** —— 那个触发器从来没被创建过。
+  **「写了」和「有了」是两件事**，中间必须有一次回读。
+  ⚠️ 顺带：`ci/smoke-verify-deploy.py` 用 13 个反向用例证明上面那个验证器**真的会报警** ——
+  一个「不会报警的验证器」和没有验证器是一样的，而且更糟：它让人以为已经有了。
 
 **闸通过 ≠ 可以发布。**
 

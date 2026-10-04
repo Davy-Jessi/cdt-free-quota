@@ -221,6 +221,36 @@ if ok:
         print("     说明事件形状与线上定时器不一致，这次校验没覆盖到那条分支。")
         ok = False
 
+# ── 7) 回读**部署事实**：触发器 / env 键 / runtime，与 inventory.json 比对 ──
+# 🔴 **这一步补的是一个真实事故。** `provision/README.md` §5.3 写着要 3 个触发器、
+#    还专门警告 `guard-liveness-8min`「别漏掉」，而线上**只有 2 个** ——
+#    那个触发器从来没被创建过，而**没有任何一步会去比对**。
+#
+#    为什么放在这里而不是只放 CI：**CI 没有云凭据**，读不到线上。
+#    部署脚本是唯一「既跑在凭据下、又必然被执行」的位置 ——
+#    所以「回读触发器清单」必须挂在这里才不会又被漏掉。
+#
+#    ⚠️ 判据是「**清单 ↔ 线上**」，不是「数量对不对」。数量相等不等于集合相等：
+#       删一个、加一个，数量照样对。
+#    ⚠️ 失败即让部署判失败 —— 这是刻意的：一个「悄悄跳过」的验证等于没有验证。
 print()
-print("部署校验: %s" % ("✔ 通过（新代码已在跑，且存活巡检分支执行无错）" if ok else "✖ 失败（仍在跑旧代码？）"))
+print("── 7) 回读部署事实（触发器 / env / runtime）──")
+_vd = os.path.join(os.path.dirname(os.path.abspath(__file__)), "verify-deploy.py")
+if not os.path.exists(_vd):
+    print("✖ 找不到 scripts/verify-deploy.py —— 无法回读触发器清单")
+    print("  ⚠️ 这一步正是当初漏掉 guard-liveness-8min 的地方，不能跳过。")
+    sys.exit(1)
+else:
+    import subprocess
+    _r = subprocess.run([sys.executable, _vd],
+                        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if _r.returncode != 0:
+        print("✖ 部署事实回读失败（退出码 %d）—— 见上面列出的具体差异。" % _r.returncode)
+        print("  ⚠️ 代码已经更新上去了，但**线上状态与清单不符**。")
+        print("     别为了让这一步变绿而删掉 inventory.json 里的声明。")
+        ok = False
+
+print()
+print("部署校验: %s" % ("✔ 通过（新代码已在跑，且存活巡检分支执行无错，部署事实已回读）"
+                        if ok else "✖ 失败（见上面的具体原因）"))
 sys.exit(0 if ok else 1)

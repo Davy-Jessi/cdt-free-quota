@@ -1,0 +1,99 @@
+{
+  "_README": [
+    "线上「应付状态」的机器可读声明。它存在的唯一理由见 README「已知问题」那条：",
+    "文档里写了「有 A、B、C 三个触发器」，而线上实际只有 A、B —— 那层保护从未生效过，",
+    "且没有任何东西会告诉你。**「写了」和「有了」是两件事。**",
+    "",
+    "这个文件是三方的**共同判据**：",
+    "  · ci/check-inventory.py   离线：清单 ↔ 文档 ↔ 源码，三方必须自洽（CI 里跑，不需要凭据）",
+    "  · scripts/verify-deploy.py 在线：清单 ↔ **线上实际状态**（需要凭据，部署后跑）",
+    "  · scripts/deploy-fc.py     部署末尾自动调用上面那个，缺失即判部署失败",
+    "",
+    "⚠️ 本文件**只放键名与契约，绝不放值**。凭据、账号 ID、桶名、公网 IP 一律不进仓库，",
+    "   形状检查（ci/check-disclosure.py）也会拦。",
+    "⚠️ 改了线上就必须改这里，否则 verify-deploy.py 会红 —— 这正是设计意图。"
+  ],
+
+  "fc": {
+    "functionName": "cdt-keeper",
+    "runtime": "nodejs18",
+    "handler": "index.handler",
+    "verSource": "scripts/fc-keeper/index.js",
+
+    "_envNote": [
+      "requiredEnv 是**键名清单**，不是值。判据方向是「线上 ⊇ 这里」。",
+      "前 11 个是 index.js 里 process.env 直接读的；TZ 是 Node 自己读的平台变量",
+      "（时间戳要 UTC+8），代码里搜不到 process.env.TZ，所以它容易被漏掉 —— 单独列出。",
+      "⚠️ FC 的 environment_variables 是**整体覆盖**语义（见 deploy-fc.py 顶部），",
+      "   少写一个键 = 删掉一个键 = 静默断链。"
+    ],
+    "requiredEnv": [
+      "ALIYUN_AK",
+      "ALIYUN_SK",
+      "ECS_INSTANCE_ID",
+      "ECS_NAME",
+      "EIP",
+      "OSS_BUCKET",
+      "OSS_ENDPOINT",
+      "PUSH_TOKEN",
+      "REGION_ID",
+      "TRAFFIC_THRESHOLD_GB",
+      "ZONE",
+      "TZ"
+    ],
+    "_envNotInSourceNote": [
+      "这几个键**在 index.js 里搜不到**，但不是多余的 —— 它们由运行时/平台自己读：",
+      "  · TZ  —— Node 用它决定 new Date() 的本地时区。护闸与 FC 的时间戳都按 UTC+8 写，",
+      "           线上漏了它，报告时间会整体差 8 小时（而代码看不出问题）。",
+      "列在这里是为了让「源码里搜不到」成为一个**显式声明的例外**，",
+      "而不是让检查器把它当成误报放过 —— 否则下次真的少传一个键也会被同样放过。"
+    ],
+    "envNotInSource": ["TZ"],
+
+    "_triggerNote": [
+      "触发器清单。**少一个就是一次静默失效** —— 尤其 guard-liveness-8min：",
+      "它是「护闸悄悄死掉」时唯一的外部观测手段。本仓库它曾**在线上不存在**。",
+      "payloadLiveness=true 的那个必须带 {\"liveness\": 1}，否则 fc-keeper 会把它",
+      "当成每日巡检 ⇒ 每 8 分钟推一条报告（约 180 条/天）。代价是刷屏，不是失明。",
+      "cron 用 6 段（含秒），与 FC 的 timer 触发器一致。",
+      "⚠️ enabled 也要声明：**「存在但被停用」与「不存在」是同一种失效** ——",
+      "   定时器还在列表里、看起来一切正常，而它一次都不会触发。",
+      "   timer 型看 triggerConfig.enable；eventbridge 型看 triggerConfig.triggerEnable。"
+    ],
+    "triggers": [
+      {
+        "name": "daily-0005-cst",
+        "type": "timer",
+        "cron": "0 5 16 * * *",
+        "enabled": true,
+        "payloadLiveness": false,
+        "role": "每日巡检报告（UTC+8 每日 00:05）"
+      },
+      {
+        "name": "ecs-statechange",
+        "type": "eventbridge",
+        "cron": null,
+        "enabled": true,
+        "payloadLiveness": false,
+        "role": "实例状态变化 / 抢占中断 —— 让 FC 立刻反应，而不是等下一个 timer"
+      },
+      {
+        "name": "guard-liveness-8min",
+        "type": "timer",
+        "cron": "0 */8 * * * *",
+        "enabled": true,
+        "payloadLiveness": true,
+        "role": "dead-man's switch：护闸停止写 OSS 时由 FC 发现并告警"
+      }
+    ]
+  },
+
+  "_docSources": [
+    "下列文件被 ci/check-inventory.py 当作「文档声称」的来源，逐条与上面比对：",
+    "  · scripts/provision/README.md  §5.3 的触发器表 —— 权威表",
+    "  · SKILL.md / README.md / docs/ —— 任何「一共 N 个触发器」的说法",
+    "对不上一律判红。**这正是当初漏掉 guard-liveness-8min 却没被发现的地方。**"
+  ],
+  "docTriggerTable": "scripts/provision/README.md",
+  "docTriggerTableSection": "### 5.3"
+}

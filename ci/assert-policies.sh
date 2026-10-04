@@ -3,7 +3,7 @@
 #
 # 用 sh 而不是依赖具体 CI 平台 —— 本地、GitHub Actions、GitLab CI 都能直接调。
 #
-# 当前 5 步：策略断言 / 凭据形态 / 泄漏闸 / %-格式化 / 未定义名。
+# 当前 7 步：策略断言 / 凭据形态 / 泄漏闸 / %-格式化 / 未定义名 / JS 语义 / 部署事实。
 # ⚠️ 步骤编号与 ci.yml、README、docs/pre-commit-checklist.md 里写的「几步」必须一致 ——
 #    早期版本这里是 4 步，而 README 把「未定义名」也列成 ci/ 的检查项，
 #    实际那一项**只在部署脚本里跑**，仓库自身的 CI 从来不看它。
@@ -31,11 +31,11 @@ echo "  使用解释器: $PY"
 fail=0
 
 echo
-echo "== 1/6 策略高危 action 断言 =="
+echo "== 1/7 策略高危 action 断言 =="
 "$PY" ci/check-policies.py policies/cdtguard-runtime-policy.json || fail=1
 
 echo
-echo "== 2/6 基础卫生：常见凭据形态 =="
+echo "== 2/7 基础卫生：常见凭据形态 =="
 # 占位符形如 <YOUR_XXX>，不会命中下面这几条。
 #
 # ⚠️⚠️ **本步刻意不排除任何路径** —— 包括 ci/ 自己。
@@ -56,14 +56,14 @@ else
 fi
 
 echo
-echo "== 3/6 泄漏闸：形状 + 哈希黑名单 =="
+echo "== 3/7 泄漏闸：形状 + 哈希黑名单 =="
 # 这一步防的是「已清除的值回流」以及「第一次出现的凭据形状」。
 # ⚠️ 它只管形状与已知值 —— 「部署者特有的选择」类问题（用了哪个网络方案、哪家云、
 #    伪装成哪个域名）抓不到，发布前仍须按 docs/pre-commit-checklist.md 人读。
 "$PY" ci/check-disclosure.py . || fail=1
 
 echo
-echo "== 4/6 %-格式化：占位符与实参个数 =="
+echo "== 4/7 %-格式化：占位符与实参个数 =="
 # 这类不匹配**只在运行时炸**，而且往往炸在**告警路径**上
 # （「守护已启动」那条推送就在 main() 开头 —— 进程会启动 2 秒内死掉，
 #   而 supervise-daemon 无限重启它，rc-service 仍显示 started）。
@@ -71,7 +71,7 @@ echo "== 4/6 %-格式化：占位符与实参个数 =="
 "$PY" ci/check-format-args.py || fail=1
 
 echo
-echo "== 5/6 未定义名 / 定义了但从未被调用（Python）=="
+echo "== 5/7 未定义名 / 定义了但从未被调用（Python）=="
 # ⚠️ 这一步以前**只**在部署脚本里跑（deploy-cdtguard.sh 把它 scp 到目标机再跑），
 #    于是仓库自身的 CI 从来不看它 —— README 却把「未定义名」列成 ci/ 的检查项之一。
 #    「本地能跑」和「每次跑」是两件事，见 .github/workflows/ci.yml 顶部那段。
@@ -99,7 +99,7 @@ if [ "$found" -eq 0 ]; then
 fi
 
 echo
-echo "== 6/6 JS 语义：fc-keeper 的决策分支冒烟 =="
+echo "== 6/7 JS 语义：fc-keeper 的决策分支冒烟 =="
 # 🔴 **这一步是补一个真实踩过的盲区。**
 #    本仓库在 fc-keeper 上栽过两次，**两次 CI 全绿**：
 #      1) 块作用域 ReferenceError（`st` 声明在 try 内、try 外引用）——
@@ -109,7 +109,7 @@ echo "== 6/6 JS 语义：fc-keeper 的决策分支冒烟 =="
 #    把每个决策分支真的跑一遍并断言 action** —— 判据是 action，
 #    不是「没抛异常」（bug 1 恰恰会被 catch 转换成不抛异常）。
 #
-#    ⚠️ 为什么单列一步而不是塞进 5/6：它需要 node，而 5/6 只需要 python。
+#    ⚠️ 为什么单列一步而不是塞进 6/7：它需要 node，而 6/7 只需要 python。
 #       缺 node 时**必须判失败**，不能静默跳过 —— 否则闸门形同不存在。
 #
 #    ⚠️ node 的查找要兼容 Windows 的 Git Bash / WSL：那边装的常是 `node.exe`，
@@ -143,9 +143,35 @@ else
 fi
 
 echo
+echo "== 7/7 部署事实：清单 ↔ 文档 ↔ 源码 + 验证器自身的冒烟 =="
+# 🔴 **这一步补的是最后一格盲区。**
+#    真实事故：`provision/README.md` §5.3 明确列了 3 个触发器、还专门警告
+#    `guard-liveness-8min`「别漏掉，它是唯一能在护闸悄悄死掉时告警的机制」——
+#    而线上**只有 2 个**，那个触发器从来没被创建过。
+#    **警告写得很到位，触发器还是没建**，因为没有任何一步会去比对。
+#    本仓库对别的失效模式都建了闸（策略 / 脱敏 / %-格式 / 未定义名 / JS 语义），
+#    唯独「部署事实」这一格是空的 —— 这里补上。
+#
+#    ⚠️⚠️ **这一步不假装能证明线上状态。** CI 里没有云凭据，
+#        `scripts/verify-deploy.py` 跑不了（它需要 AK/SK/UID）。
+#        所以这里只做**离线**那一半：清单 ↔ 文档 ↔ 源码三方自洽。
+#        那是**必要条件，不是充分条件** —— 三处都写对而线上依然错，是完全可能的
+#        （这次事故就是）。真正的回读在 `scripts/verify-deploy.py`，
+#        由 `deploy-fc.py` 在部署末尾自动调用。
+#        把这一步说成「已验证线上」是错的，而且正是当初漏掉它的原因。
+"$PY" ci/check-inventory.py || fail=1
+
+# 顺带证明「验证器真的会报警」。
+# ⚠️ 单独一个用例：一个**不会报警的验证器**和没有验证器是一样的，而且更糟 ——
+#    它让人以为已经有了。所以喂给它 13 种漂移，每一种都必须报出对应的那一条。
+#    它不需要凭据、也不需要装 FC SDK（compare() 被抽成了纯函数）。
+"$PY" ci/smoke-verify-deploy.py || fail=1
+
+echo
 if [ "$fail" -eq 0 ]; then
   echo "全部通过"
 else
   echo "有检查未通过"
 fi
 exit "$fail"
+
