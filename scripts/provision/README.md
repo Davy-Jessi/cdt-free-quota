@@ -136,6 +136,23 @@ aliyun ram AttachPolicyToRole --PolicyType Custom \
 > `acs:oss:*:*:<YOUR_OSS_BUCKET>/cdtguard/*`** —— 必须先替换成你的桶名，
 > 否则守护连自己的状态对象都读写不了。
 
+> 🔴 **同一份策略里，`ecs:StopInstance` 的资源范围是 `*`，不是那一台实例 ——
+> 也就是说这个角色能停你账号下**任意**一台 ECS。**
+> 这不是随手写的：官方 API 表里 `ecs:StopInstance` **支持**资源级授权
+> （资源类型 `Instance`，ARN `acs:ecs:{regionId}:{accountId}:instance/{instanceId}`），
+> 所以它**可以**收窄。之所以没写死，是因为实例 ID 在创建之后才知道，
+> 而这份策略要在 §3.1 就建好 —— 想收窄就**在拿到实例 ID 之后再改一次策略**：
+>
+> ```json
+> { "Effect": "Allow", "Action": ["ecs:StopInstance"],
+>   "Resource": "acs:ecs:cn-hongkong:<YOUR_ACCOUNT_UID>:instance/<YOUR_INSTANCE_ID>" }
+> ```
+>
+> ⚠️ 同理，`ecs:TagResources` / `ecs:UntagResources` 也是 `*`。
+> 本仓库**没有**把它们收窄过，也没有实测过收窄后守护是否仍能正常打标签 ——
+> 所以上面那段是**方向建议**，不是【实测】结论。收窄后请按 SKILL 第 5 步的
+> `DryRun` 自检确认停机路径没被打死（那一步正是为这类问题准备的）。
+
 ### 3.2 三个角色 **【未实测】**
 
 方案一共要 **3 个角色**。仓库只提供了第 1 个的信任策略：
@@ -217,6 +234,18 @@ ossutil mb "oss://$OSS_BUCKET" --region "$REGION"
 > 而且它会出现在策略 ARN、日志、截图里。随便取个不带个人信息的名字即可。
 
 ### 4.5 ECS **【未实测，且是最容易漏参数的一步】**
+
+> 🔴⚠️⚠️ **先看这一行再抄下面的命令：确认里面有 `--SpotInterruptionBehavior Stop`。**
+> 它是「节省停机模式」的开关，官方默认值是 `Terminate` —— **直接释放实例、
+> 连系统盘一起销毁**。而它**创建后不可修改**：漏了只能删掉实例重建。
+>
+> 为什么把警告提到命令**前面**：这段警告原先只写在下面的参数表里（表在命令之后）。
+> 本仓库的 [`pre-commit-checklist.md`](../../docs/pre-commit-checklist.md) 明令自查
+> 「有没有步骤**按字面执行会有不可逆后果或费用，而警告写在后面**」——
+> 这就是那一类。**抄命令的人不会先往下读 30 行表格。**
+>
+> 后果链（漏了它 = 整套守护静默失效）：实例被销毁 → 实例 ID 失效、Tag 消失 →
+> FC 的 `StartInstance` 兜底**永远不可能成功** → 回退查找也找不到 → **静默 fail-open**。
 
 ```sh
 aliyun ecs RunInstances \
