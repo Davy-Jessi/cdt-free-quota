@@ -331,6 +331,50 @@ def check_docs(doc):
         elif claims:
             print("  OK %s 的 %d 处计数说法一致" % (f, len(claims)))
 
+    # ④ **「N 个脚本」这类计数也要回读。**
+    #    🔴 这一条来自一次**真实的、我自己犯的**错误：刚给 ci/ 加了两个脚本，
+    #       README 的目录树里却还写着「7 个脚本；其中 5 个由 assert-policies.sh
+    #       串起来」—— 实际是 9 个文件、7 个被调用。
+    #       讽刺的是我**上一个提交刚建好这道闸**，而闸没盖到这里，
+    #       于是同一个 bug（写下的数字没人回读）在闸建好的第二天又发生了一次。
+    #
+    #    ⚠️ 判据要**从文件系统数**，不能从文档里数 —— 后者是自证。
+    #       而且两个数字都要对：文件总数、以及「被 assert-policies.sh 真正调用」
+    #       的个数（两者不相等是正常的：compare-code.py 要你手上有原件，CI 跑不了）。
+    import glob as _glob
+    # ⚠️ 用 pathlib 取文件名，**不要** `p.split("/")` —— glob 返回的是**本机分隔符**，
+    #    在 Windows 上是 `ci\check-names.py`，按 `/` 切不开，于是打印出一整串路径。
+    #    （Linux CI 上不会暴露，所以这类 bug 只在本地跑时才看得见。）
+    ci_files = sorted(pathlib.Path(p).name for p in _glob.glob("ci/*")
+                      if pathlib.Path(p).is_file())
+    ap = _read_text("ci/assert-policies.sh") or ""
+    invoked = sorted(set(re.findall(r"ci/([A-Za-z0-9_.-]+\.(?:py|js|sh))", ap)))
+    invoked = [x for x in invoked if x != "assert-policies.sh"]
+    for f in ("README.md",):
+        t = _read_text(f)
+        if t is None:
+            continue
+        m = re.search(r"静态断言（(\d+) 个脚本；其中 (\d+) 个由 ([a-z-]+\.sh) 串起来）", t)
+        if not m:
+            print("  ⚠ %s 里找不到「静态断言（N 个脚本…）」那句 —— 跳过本项" % f)
+            continue
+        d_total, d_inv, d_entry = int(m.group(1)), int(m.group(2)), m.group(3)
+        errs = []
+        if d_total != len(ci_files):
+            errs.append("文件总数：文档 %d，实际 %d（%s）"
+                        % (d_total, len(ci_files), ", ".join(ci_files)))
+        if d_inv != len(invoked):
+            errs.append("被 %s 调用的个数：文档 %d，实际 %d（%s）"
+                        % (d_entry, d_inv, len(invoked), ", ".join(invoked)))
+        if errs:
+            print("  X %s 的 ci/ 脚本计数与实际不符：" % f)
+            for e in errs:
+                print("      %s" % e)
+            bad += 1
+        else:
+            print("  OK %s 的 ci/ 脚本计数与实际一致（%d 个文件，%d 个被调用）"
+                  % (f, d_total, d_inv))
+
     return bad
 
 

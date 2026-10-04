@@ -54,7 +54,7 @@
 ├── .env.example              ← 环境变量清单（**只列有 env 入口的键**；裸字面量常量见文件内「第一组补充」）
 ├── .pre-commit-config.yaml   ← 提交前凭据扫描（gitleaks + 真实凭据形态）
 ├── inventory.json            ← **线上应付状态**的机器可读声明（触发器 / env 键 / runtime）
-├── ci/                       ← 静态断言（7 个脚本；其中 5 个由 assert-policies.sh 串起来）
+├── ci/                       ← 静态断言（9 个脚本；其中 7 个由 assert-policies.sh 串起来）
 │   ├── assert-policies.sh    ← 入口：策略 + 凭据形态 + 泄漏闸 + %-格式化 + 未定义名 + JS 语义 + 部署事实
 │   ├── check-policies.py     ← 高危 action 既未放行、也被显式 Deny
 │   ├── check-disclosure.py   ← 泄漏闸：形状检查 + 哈希黑名单 + 代码位置占位符
