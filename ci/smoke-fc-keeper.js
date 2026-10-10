@@ -55,8 +55,17 @@ if (!require('fs').existsSync(TARGET)) {
 
 // ── 可编程的桩状态 ──────────────────────────────────────────────────
 const S = {
-  ossBody: null,      // OSS GET 返回的正文
-  ossStatus: 200,     // OSS GET 的状态码
+  ossBody: null,      // 主状态对象（cdtguard/state.json）的正文
+  ossStatus: 200,     // 主状态对象的 GET 状态码
+  ossTries: 0,        // 主状态对象被请求了几次（验重试用）
+  // ⚠️ 告警冷却状态是**另一个键**（cdt-keeper/alert-state.json）。
+  //    早先桩件对所有 OSS URL 返回同一个 body，于是冷却读取会拿到
+  //    **主状态的正文** —— 里面没有冷却时间戳，冷却等于没生效，
+  //    断言全挂在「推了 0 条」上。桩件必须**按 key 区分**，
+  //    否则测的不是真实行为。
+  alertBody: null,    // 冷却状态的正文（null = 当作不存在/404）
+  alertStatus: 404,   // 冷却状态默认不存在（真实首次运行时就是这样）
+  alertThrows: false, // 让冷却状态的读取抛网络错误（测 fail-open）
   instStatus: 'Running',
   instEmpty: false,   // DescribeInstances 返回空数组
   tagValue: null,     // 实例上的 cdt-halted-month
@@ -64,9 +73,19 @@ const S = {
   pushed: [],
 };
 
+// 由 main() 注入 —— 让 resetState 也能清掉模块级冷却态。
+// ⚠️ 必须声明在 resetState **之前**：`let` 在初始化前是 TDZ，
+//    而 resetState 里用 `typeof reloadFn` 读它 —— 那时会抛 ReferenceError
+//    （`typeof` 对 TDZ 变量**不**返回 undefined）。顺序错了就是反例。
+let reloadFn = null;
+
 function resetState() {
-  S.ossBody = null; S.ossStatus = 200; S.instStatus = 'Running';
+  S.ossBody = null; S.ossStatus = 200; S.ossTries = 0;
+  S.alertBody = null; S.alertStatus = 404; S.alertThrows = false;
+  S.instStatus = 'Running';
   S.instEmpty = false; S.tagValue = null; S.startResp = {}; S.pushed = [];
+  // ⚠️ 内存冷却态在模块作用域里，只能靠**重新 require** 清掉（模拟冷启动）。
+  if (reloadFn) reloadFn();
 }
 
 global.fetch = async (url, opt) => {
@@ -75,7 +94,18 @@ global.fetch = async (url, opt) => {
     S.pushed.push(opt && opt.body ? String(opt.body) : '');
     return { status: 200, text: async () => '{"code":200}' };
   }
+  if (u.includes('alert-state')) {
+    // 冷却状态：独立于主状态
+    if (S.alertThrows) throw new TypeError('fetch failed');
+    return { status: S.alertStatus, text: async () => S.alertBody, headers: new Map() };
+  }
   if (u.includes('smoke-bucket')) {
+    // ⚠️ 只统计**主状态对象的 GET**。
+    //    早先写成「任何 smoke-bucket 请求都 +1」，于是 handler 末尾那笔
+    //    `ossPut('last-run.json')` 也被算进去 —— 断言"只请求 1 次"就永远
+    //    得到 2。统计口径写宽了，断言就在测一件别的事。
+    const isStateGet = u.includes('state.json') && (!opt || !opt.method || opt.method === 'GET');
+    if (isStateGet) S.ossTries++;
     return { status: S.ossStatus, text: async () => S.ossBody, headers: new Map() };
   }
   if (u.includes('aliyuncs.com')) {
@@ -140,9 +170,24 @@ async function main() {
   const mute = () => { console.log = (...a) => { silent.push(a.map(String).join(' ')); }; };
   const unmute = () => { console.log = realLog; };
 
-  mute();
-  const { handler } = require(TARGET);
-  unmute();
+  // ⚠️⚠️ **每个场景都要「冷启动」一次。**
+  //    fc-keeper 有一份**模块级内存态**（告警冷却，见 `_memAlertAt`）——
+  //    那在线上是**刻意的**（热实例内兜底），但同一个 Node 进程里跑完所有
+  //    场景时，前一个场景设的冷却会挡住后一个：
+  //    实测症状就是「期望推 1 条、实际 0 条」，而且只在**同类告警**之间发生
+  //    （⑮ 与 ⑱ 都是 guard-stale）。
+  //
+  //    解法是删 require 缓存重新加载 —— 等价于 FC 的一次冷启动，
+  //    于是每个场景都在干净的状态上跑。**不给生产代码加测试专用的 reset 钩子**：
+  //    那种钩子会进线上包，而且它本身就是一个"只有测试会走的路径"。
+  let handler = null;
+  const reload = () => {
+    delete require.cache[require.resolve(TARGET)];
+    mute();
+    try { handler = require(TARGET).handler; } finally { unmute(); }
+  };
+  reloadFn = reload;
+  reload();
 
   const callHandler = async (ev) => {
     mute();
@@ -252,6 +297,131 @@ async function main() {
   const withVer = await callHandler(livenessEv());
   checkTruthy('⑬ 返回体带 ver', withVer.ver);
   check('⑬ ver 非空', typeof withVer.ver === 'string' && withVer.ver.length > 0, true);
+
+  // ═══ ④ 冷却 / 重试 / 可归因（v6 新增）═══════════════════════════════
+  // 🔴 这一组防的是**重复推送**，而它的发现过程本身就是一条教训：
+  //    线上收到一条「读不到 OSS」告警，复核时发现——**那次是瞬时抖动**，
+  //    而这条判据的语义是"持续不可达"。顺着一查，发现 `push()` 根本没有
+  //    任何冷却，于是**任何持续状况都会每 8 分钟响一次**（约 180 条/天）。
+  //    最严重的一条不是 OSS，而是 `skip-halted`：
+  //    「额度用尽 ⇒ 停机」是**设计稳态**，可能持续整月。
+  //
+  // ⚠️ 判据仍然是 action（不变），这里断言的是**推送次数**。
+  console.log('\n【告警冷却：持续状况不得反复推送】');
+
+  // ⑭ 存活巡检连打 5 次（模拟 40 分钟）—— OSS 一直读不到，应只推 1 条
+  resetState();
+  S.ossStatus = 403; S.ossBody = '';
+  const actSeen = [];
+  for (let i = 0; i < 5; i++) actSeen.push((await callHandler(livenessEv())).action);
+  check('⑭ OSS 持续读不到 ×5 → action 每次都仍是 error-oss-unreadable',
+        actSeen.every((a) => a === 'error-oss-unreadable'), true);
+  check('⑭ 但只推送 1 条（冷却生效，不是 5 条）', S.pushed.length, 1);
+
+  // ⑮ 同样的冷却必须覆盖「护闸失联」—— 它才是最该被反复提醒却又最吵的
+  resetState();
+  S.ossBody = JSON.stringify({ month, eff: 1e9, halted: 0, ts: minsAgo(60) });
+  for (let i = 0; i < 5; i++) await callHandler(livenessEv());
+  check('⑮ 护闸失联 ×5 → 只推送 1 条', S.pushed.length, 1);
+
+  // ⑯ **skip-halted 稳态在存活巡检下完全不推** —— 这条是最大宗（约 180 条/天）
+  //    ⚠️ 判据与 action 都不变，只是不推送。
+  resetState();
+  S.tagValue = month; S.instStatus = 'Stopped';
+  S.ossBody = JSON.stringify({ month, eff: 2e11, halted: 1, ts: nowIso() });
+  for (let i = 0; i < 5; i++) {
+    const r = await callHandler(livenessEv());
+    if (r.action !== 'skip-halted') { check('⑯ 存活巡检应落进 skip-halted', r.action, 'skip-halted'); }
+  }
+  check('⑯ 存活巡检下 skip-halted ×5 → 推送 0 条（稳态静默）', S.pushed.length, 0);
+
+  // ⑯b 但**每日巡检**仍要推 —— 否则「今天停机了」就再也没人告知
+  resetState();
+  S.tagValue = month; S.instStatus = 'Stopped';
+  S.ossBody = JSON.stringify({ month, eff: 2e11, halted: 1, ts: nowIso() });
+  await callHandler(dailyEv());
+  check('⑯b 每日巡检的 skip-halted 仍推 1 条', S.pushed.length, 1);
+
+  // ⑰ 冷却**不得吞掉一次性事件**：每日巡检报告不属于那几类持续告警
+  resetState();
+  S.ossBody = JSON.stringify({ month, eff: 1e9, halted: 0, ts: nowIso() });
+  await callHandler(dailyEv());
+  await callHandler(dailyEv());
+  check('⑰ 每日巡检报告不受冷却影响（连打 2 次推 2 条）', S.pushed.length, 2);
+
+  // ⑱ 冷却状态读不到时**必须仍然告警**（宁可多推，绝不静默）
+  //    ⚠️ 这是双存储设计里「OSS 那一路失效」的分支。
+  resetState();
+  S.alertThrows = true;
+  S.ossBody = JSON.stringify({ month, eff: 1e9, halted: 0, ts: minsAgo(60) });
+  const r18 = await callHandler(livenessEv());
+  check('⑱ 冷却状态读不到 → 仍然推送（不静默）', S.pushed.length, 1);
+  check('⑱ action 仍是 error-guard-stale', r18.action, 'error-guard-stale');
+  checkTruthy('⑱ 且返回体标了 cooldownBypassed（事后可解释）', r18.cooldownBypassed);
+
+  // ⑱b 内存冷却必须真的兜底：冷却状态一直读不到时，第 2 次也不该再推
+  //     （这验证「内存态」不是摆设 —— 它正是 OSS 挂掉时的那一路）
+  S.pushed = [];
+  await callHandler(livenessEv());
+  check('⑱b 冷却状态持续读不到 → 内存态兜底，第 2 次不推', S.pushed.length, 0);
+
+  console.log('\n【OSS 读取健壮性】');
+
+  // ⑲ 首次失败、第二次成功 → **不应告警**（单次抖动必须被吸收）
+  //    这是本次真实误报的直接回归：判据仍是"读不到就响铃"，
+  //    但"读得到"就不该响 —— 哪怕第一次尝试失败了。
+  resetState();
+  S.ossStatus = 200;
+  S.ossBody = JSON.stringify({ month, eff: 1e9, halted: 0, ts: nowIso() });
+  {
+    // 只让**第 1 次**主状态请求抛错
+    const inner = global.fetch;
+    let n = 0;
+    global.fetch = async (url, opt) => {
+      if (String(url).includes('smoke-bucket')) {
+        n++;
+        if (n === 1) throw new TypeError('fetch failed');
+      }
+      return inner(url, opt);
+    };
+    const r19 = await callHandler(livenessEv());
+    global.fetch = inner;
+    check('⑲ 首次抖动、重试成功 → liveness-ok（误报被吸收）', r19.action, 'liveness-ok');
+    check('⑲ 且没有推送', S.pushed.length, 0);
+    checkTruthy('⑲ 确实重试过（尝试次数 > 1）', n > 1);
+  }
+
+  // ⑳ 两次都失败 → 仍必须告警，且**错误可归因**（带 cause 的 code）
+  resetState();
+  {
+    const inner = global.fetch;
+    global.fetch = async (url, opt) => {
+      if (String(url).includes('smoke-bucket')) {
+        const e = new TypeError('fetch failed');
+        e.cause = Object.assign(new Error('getaddrinfo EAI_AGAIN'), { code: 'EAI_AGAIN' });
+        throw e;
+      }
+      return inner(url, opt);
+    };
+    const r20 = await callHandler(livenessEv());
+    global.fetch = inner;
+    check('⑳ 两次都失败 → error-oss-unreadable', r20.action, 'error-oss-unreadable');
+    checkTruthy('⑳ 且 ossErr 带得上真实原因（EAI_AGAIN）',
+                r20.ossErr && r20.ossErr.includes('EAI_AGAIN'));
+  }
+
+  // ㉑ 非 200（确定性失败）不该白重试 —— 只打一次 OSS 请求
+  resetState();
+  S.ossStatus = 403; S.ossBody = '';
+  const r21 = await callHandler(livenessEv());
+  check('㉑ HTTP 403 → error-oss-unreadable', r21.action, 'error-oss-unreadable');
+  check('㉑ 确定性失败只请求 1 次（不重试）', S.ossTries, 1);
+  // ⚠️ 这条断言来自一个**实测踩到的缺陷**：`ossGet` 对非 200 是 `return null`
+  //    （不抛），所以 catch 不执行 ⇒ 状态码永远不会进 ossErr ⇒
+  //    告警正文那行「【OSS 错误】」永远显示「(无)」。
+  //    最有诊断价值的 400/403/404 反而最没信息。
+  checkTruthy('㉑ 且 ossErr 记录了状态码（403）',
+              r21.ossErr && r21.ossErr.includes('403'));
 
   console.log(`\n通过 ${pass}，失败 ${fail}`);
   if (fail) {

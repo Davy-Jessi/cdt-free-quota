@@ -16,8 +16,19 @@
 //   ② s !== 'Stopped'    → noop；若 st.ts 超 STALE_MIN 分钟 → 推「护闸失联」
 //                          （存活巡检在这一层被静默跳过，见 isLiveness）
 //   ③ halted             → skip-halted（本月已因达阈值停机，绝不拉起）
+//                          ⚠️ 存活巡检下**不推送**（稳态，见 pushThrottled）
 //   ④ 熔断：1 小时内已拉起 >= LOOP_MAX 次 → 拒绝拉起并告警
 //   ⑤ 拉起              → start-under-threshold / start-failed
+//
+// ⚠️ **所有会反复出现的告警都走 `pushThrottled`（1 小时冷却）。**
+//    判据不变、`action` 不变、`last-run.json` 照常记录 —— 少掉的只是重复通知。
+//    为什么必须有：存活巡检 8 分钟一次，没有冷却就是约 180 条/天。
+//    ⚠️ 冷却状态**双存储**（OSS + 模块内存）：只存 OSS 有个自相矛盾的失效 ——
+//       最需要冷却的「OSS 读不到」场景，恰好读不到冷却状态。
+//       详见 `alertAllowed` 上方那段。
+//    ⚠️ 一次性/低频的告警（每日巡检、拉起成功、spot 预警、FC 异常）
+//       仍用裸 `push()` —— 它们本来就不会每 8 分钟重复，加冷却反而可能
+//       把一次真实事件吞掉。
 //
 // ⚠️⚠️ 修复（详见本文件内的注释）：
 //   A) `ossHalted` 必须**绑定月份**。旧写法 `!!st.halted` 只看布尔 —— 而护闸
@@ -120,9 +131,46 @@ const OSS_ENDPOINT = process.env.OSS_ENDPOINT || 'oss-cn-hongkong.aliyuncs.com';
 //       v5：修一个**实测确认过的 fail-open** —— OSS 对象读到了但没有可用 `ts` 时，
 //           失联判据被算成 0、「护闸疑似失联」永不触发，且全程静默。
 //           现在走独立的 `error-oss-ts-missing` 响铃分支。
-const VER = 'v5-oss-ts-missing';
+//       v6：三个改动，都来自一次**线上误报的复核**：
+//           ① `ossGet` 加**超时 + 重试**。原实现是裸 `fetch`：没有超时
+//              （对端不回包会吃光函数超时，连告警都发不出去），
+//              也没有重试（一次瞬时抖动就被判成"读取失败"）。
+//           ② `errDetail()`：把 `fetch failed` 背后的 `e.cause.code` 挖出来。
+//              原来只存 `String(e)`，导致故障**原理上不可归因** ——
+//              分不清 EAI_AGAIN(DNS) / ECONNRESET / ETIMEDOUT。
+//           ③ **告警冷却**（1 小时/类型）。原来 `push()` 没有任何去重，
+//              任何持续状况都会每 8 分钟响一次（约 180 条/天）。
+//              实测确认的重复源有三个：OSS 读不到、护闸失联、
+//              以及 **skip-halted（额度用尽的设计稳态，一个月里最大宗）**。
+const VER = 'v6-oss-retry-cooldown';
 const STATE_KEY = 'cdtguard/state.json';
 const PUSH_TOKEN = requireEnv('PUSH_TOKEN');
+
+// ── OSS 访问的健壮性参数 ────────────────────────────────────────────
+// 🔴 这两个值的来历是一次**线上误报**：13:32 收到「！！ CDT FC 读不到 OSS 状态」，
+//    而前后 3.5 小时 OSS 一直可达、FC 连打 35 次 0 失败。
+//    也就是说：**一次瞬时抖动被升格成了一条系统性故障告警。**
+//    判据（读不到就响铃）是对的，缺的是「瞬时 vs 持续」的区分。
+// 超时：单次尝试的上限。60 秒是函数总超时，留足余量给重试 + 推送。
+const OSS_TIMEOUT_MS = 8000;
+// 重试间隔：必须要 —— 立即重试常常撞上同一个瞬时故障（同一个连接池 / 同一次抖动）。
+const OSS_RETRY_DELAY_MS = 600;
+// 重试次数（总尝试次数，不是"额外重试次数"）。
+const OSS_ATTEMPTS = 2;
+
+// ── 告警冷却 ────────────────────────────────────────────────────────
+// 🔴 为什么要它：`push()` 本身**没有任何去重或冷却**（实测：连续调用 6 次，
+//    6 次都推）。而存活巡检是 8 分钟一次 ⇒ OSS 只要持续不可达超过 8 分钟，
+//    就会**每 8 分钟响一次**，直到恢复。
+//    ⚠️ 这不是「读不到 OSS」这一条特有的 —— 「护闸疑似失联」同样每次都推。
+//       两条都需要冷却。
+//    冷却状态存 OSS（FC 是无状态的），键后缀带告警类型，
+//    这样两类告警各自计时、互不遮挡。
+//    ⚠️ 冷却窗口内**照常判定、照常返回 action**，只是**不发推送** ——
+//       观测能力不下降（last-run.json 里仍能看到每次的 action），
+//       下降的只有重复通知。
+const ALERT_COOLDOWN_MS = 3600 * 1000;   // 1 小时
+const ALERT_STATE_KEY = 'cdt-keeper/alert-state.json';
 const HALT_TAG = 'cdt-halted-month';
 const NL = String.fromCharCode(10);
 // 部署校验用：部署脚本调用一次函数并断言返回的 ver 等于期望值。
@@ -184,15 +232,102 @@ async function aliCall(action, version, params, endpoint) {
     return j;
   } catch (e) { return { parseError: t.slice(0, 200), status: r.status }; }
 }
-async function ossGet(key) {
+// ── 错误归因：把 fetch 的真实原因挖出来 ──────────────────────────────
+// 🔴 为什么需要它：实测收到过一条线上告警，正文里只有
+//      【OSS 错误】TypeError: fetch failed
+//    而 `fetch failed` 是 Node undici 的**外层包装**，真实原因在 `e.cause` 里：
+//      · cause.code = 'EAI_AGAIN'   → DNS 解析失败
+//      · cause.code = 'ECONNRESET'  → 连接被重置（对端断、中间设备 RST）
+//      · cause.code = 'ETIMEDOUT'   → 超时
+//      · cause.code = 'ENOTFOUND'   → 域名不存在
+//    丢掉 cause ⇒ **这个故障在原理上就不可归因**：不管谁去查，
+//    都只能停在「网络抖了一下」，无法区分「DNS 出问题」还是「对端拒绝」。
+//    这不是"信息不够"，是**观测点缺失** —— 所以补在这里。
+//
+//    ⚠️ 只用于**展示**，不参与任何判定：判定仍只看「读到 / 没读到」。
+function errDetail(e) {
+  if (!e) return '(未知错误)';
+  const parts = [String(e)];
+  // undici 把真实原因挂在 e.cause；有些实现还会再包一层
+  const c = e.cause;
+  if (c) {
+    const code = c.code || c.errno || '';
+    parts.push('cause=' + (code ? code + ' ' : '') + (c.message || String(c)));
+    if (c.cause) {
+      const c2 = c.cause;
+      parts.push('cause2=' + (c2.code || c2.message || String(c2)));
+    }
+  }
+  return parts.join(' | ').slice(0, 200);
+}
+
+// 最近一次 OSS 访问的诊断信息（HTTP 状态码或错误归因）。
+// 为什么用模块级变量而不是返回值：`ossGet` 有两个调用点，返回信封会改动
+// 两处的契约；而调用方真正需要的只是「为什么没读到」，塞进 out.ossErr 即可。
+let OSS_DIAG = '';
+
+async function ossFetchOnce(url, opts, ms) {
+  // ⚠️ 必须有超时。裸 `fetch` **没有默认超时** —— 对端不回包时会一直挂着，
+  //    直到把 FC 的整个 60 秒函数超时吃光，那时连告警都发不出去
+  //    （函数被杀，push 根本没机会执行）。
+  //    实测那次故障是**快速失败**（fetch failed），不是挂起 —— 但两种都要防。
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), ms);
+  try {
+    return await fetch(url, Object.assign({ signal: ac.signal }, opts));
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function ossGet(key, opt) {
   if (!OSS_BUCKET) return null;
-  const date = new Date().toUTCString();
-  const sts = ['GET', '', '', date, '/' + OSS_BUCKET + '/' + key].join(NL);
-  const sig = crypto.createHmac('sha1', SK).update(sts).digest('base64');
-  const r = await fetch('https://' + OSS_BUCKET + '.' + OSS_ENDPOINT + '/' + key,
-    { headers: { Date: date, Authorization: 'OSS ' + AK + ':' + sig } });
-  if (r.status !== 200) return null;
-  try { return JSON.parse(await r.text()); } catch (e) { return null; }
+  const url = 'https://' + OSS_BUCKET + '.' + OSS_ENDPOINT + '/' + key;
+  const o = opt || {};
+
+  // ⚠️ 重试一次，用来吸收**单次网络抖动**。
+  //    动机是一次真实误报：OSS 抖了一下 → 判定"读不到" → 推了一条
+  //    「！！ CDT FC 读不到 OSS 状态」。而那个判据的语义是**持续不可达**，
+  //    不是"这一毫秒没成功"。判据不变（仍然读不到就响铃），
+  //    只是把**瞬时**失败和**持续**失败区分开。
+  //
+  //    ⚠️ 只重试**网络错误**，不重试 HTTP 非 200：
+  //       403/404 是确定性结果，重试只是浪费时间、把函数超时往前推。
+  //
+  //    ⚠️ `attempts: 1` 是给**尽力而为**的读取用的（例如告警冷却状态）：
+  //       那种读取失败不该把函数超时预算再吃掉一份。
+  const attempts = o.attempts || OSS_ATTEMPTS;
+  const timeoutMs = o.timeoutMs || OSS_TIMEOUT_MS;
+  let lastErr = null;
+  for (let i = 0; i < attempts; i++) {
+    if (i) await new Promise((r) => setTimeout(r, OSS_RETRY_DELAY_MS));
+    try {
+      const date = new Date().toUTCString();
+      const sts = ['GET', '', '', date, '/' + OSS_BUCKET + '/' + key].join(NL);
+      const sig = crypto.createHmac('sha1', SK).update(sts).digest('base64');
+      const r = await ossFetchOnce(url,
+        { headers: { Date: date, Authorization: 'OSS ' + AK + ':' + sig } },
+        timeoutMs);
+      if (r.status !== 200) {
+        // 确定性失败：记下状态码，不重试
+        OSS_DIAG = 'HTTP ' + r.status;
+        return null;
+      }
+      try {
+        const j = JSON.parse(await r.text());
+        OSS_DIAG = 'HTTP 200';
+        return j;
+      } catch (e) {
+        OSS_DIAG = 'HTTP 200 但正文不是合法 JSON: ' + String(e).slice(0, 80);
+        return null;
+      }
+    } catch (e) {
+      lastErr = e;
+      OSS_DIAG = errDetail(e);
+    }
+  }
+  // 全部尝试都失败 ⇒ 抛出去，让调用方按「读不到」处理（fail-loud）
+  throw lastErr || new Error('ossGet 失败');
 }
 async function ossPut(key, obj) {
   if (!OSS_BUCKET) return 'no-bucket';
@@ -208,6 +343,99 @@ async function ossPut(key, obj) {
                  Authorization: 'OSS ' + AK + ':' + sig },
       body: content });
   return r.status;
+}
+
+// ── 告警冷却 ────────────────────────────────────────────────────────
+// 判据：同一个告警类型在 ALERT_COOLDOWN_MS 内只发一次。
+//
+// 🔴 为什么需要它：`push()` 本身**没有任何去重或冷却**（实测：连续调用 6 次，
+//    6 次都推）。而存活巡检是 8 分钟一次 ⇒ 任何**持续**状况都会
+//    每 8 分钟响一次（约 180 条/天）。实测确认的重复源至少有三个：
+//      · OSS 读不到（本次收到的那条告警）
+//      · 「护闸疑似失联」
+//      · **skip-halted** —— 额度用尽后的**设计稳态**，一个月里可能长期如此
+//
+// ⚠️⚠️ **双存储，缺一不可。** 只存 OSS 会有个自相矛盾的失效：
+//    最需要冷却的场景恰恰是 **OSS 读不到**的时候 —— 那时冷却状态也读不到，
+//    于是每次都旁路、每次都推，冷却在最需要它时正好不起作用（实测这个矛盾）。
+//    所以：
+//      · **OSS**（跨实例、跨冷启动都有效）—— 读不到就跳过它
+//      · **模块级内存**（同一热实例内有效）—— OSS 挂掉时由它兜底
+//    取两者的**较新值**判断。FC 的热实例会被复用若干次，
+//    足够把「OSS 全程不可用」这种极端情况下的推送频率压下来。
+//    ⚠️ 两者都拿不到（冷启动 + OSS 挂）时**仍然告警** —— 宁可多推，绝不静默。
+//       这与「读不到 OSS 就响铃」的方向一致。
+const _memAlertAt = Object.create(null);   // kind -> ms（热实例内有效）
+
+async function alertAllowed(kind) {
+  const now = Date.now();
+  let ossLast = 0;
+  let ossOk = false;
+  let ossState = null;
+  try {
+    // attempts:1 —— 冷却查询是尽力而为，不值得为它再花一份超时预算
+    ossState = await ossGet(ALERT_STATE_KEY, { attempts: 1, timeoutMs: 4000 });
+    ossOk = true;
+    ossLast = (ossState && ossState[kind]) || 0;
+  } catch (e) {
+    // 读不到就退回内存态 —— 不旁路
+  }
+  const memLast = _memAlertAt[kind] || 0;
+  const last = Math.max(ossLast, memLast);
+
+  if (last && (now - last) < ALERT_COOLDOWN_MS) {
+    return { allowed: false, lastAt: last, bypassed: false };
+  }
+
+  // 先记时间戳再返回"允许"。记录失败**不阻止**本次告警（见上）。
+  _memAlertAt[kind] = now;
+  if (ossOk) {
+    try {
+      const merged = Object.assign({}, ossState || {});
+      merged[kind] = now;
+      await ossPut(ALERT_STATE_KEY, merged);
+    } catch (e) { /* 写不进不影响本次告警 */ }
+  }
+  // 两个存储都没用上 ⇒ 显式标记，便于事后解释"为什么又推了"
+  const bypassed = !ossOk && !memLast;
+  return { allowed: true, lastAt: last, bypassed };
+}
+
+// 带冷却的推送。
+//
+// ⚠️ **返回值仍然是字符串**（与 `push()` 一致）—— 因为 `out.push` 一直是
+//    「推送结果字符串」，被写进 last-run.json。改成对象会悄悄改变那个契约，
+//    而 last-run.json 正是排查时读的东西。
+//    被冷却时返回一句**显式说明**，而不是 null/空串：
+//    空串会与「推送失败」混淆。三种情况必须能区分：
+//      推送成功（{"code":200,...}） / 推送失败（ERR ...） / 被冷却跳过（下面这句）
+//
+// ⚠️ `silentWhenLiveness` 用于**稳态**：存活巡检每 8 分钟来一次，
+//    对「本来就该如此」的状态（额度用尽）不该重复通知。
+//    判据与 action 照常，只是**不推送** —— 观测能力不下降。
+//
+//    ⚠️ 存活与否必须由**参数**传入，不要读 `out.evIsLiveness` ——
+//       那个字段是 decide() **返回之后**才赋值的，在 decide() 内部读到的是
+//       undefined，会让这个判断静默失效（正是本仓库反复栽的那类顺序依赖）。
+async function pushThrottled(kind, title, content, out, isLiveness, opts) {
+  const o = opts || {};
+  if (o.silentWhenLiveness && isLiveness) {
+    if (out) { out.pushSkipped = kind + '(liveness 静默)'; }
+    return '(存活巡检：稳态，按设计不推送；状态仍写入 last-run.json)';
+  }
+  const g = await alertAllowed(kind);
+  if (!g.allowed) {
+    if (out) {
+      out.pushSkipped = kind;
+      out.pushCooldownMin = Math.round(ALERT_COOLDOWN_MS / 60000);
+    }
+    return '(冷却中：同一告警在 ' + Math.round(ALERT_COOLDOWN_MS / 60000)
+             + ' 分钟内已推过一次，本次未重复推送)';
+  }
+  if (out && g.bypassed) {
+    out.cooldownBypassed = true;
+  }
+  return await push(title, content);
 }
 async function instInfo() {
   const d = await aliCall('DescribeInstances', '2014-05-26',
@@ -334,7 +562,22 @@ async function decide(source, evKeys, evResId, isPreempt, isLiveness) {
           ossTsMissing = true;
         }
       }
-    } catch (e) { out.ossErr = String(e).slice(0, 80); ossUnreadable = !!OSS_BUCKET; }
+    } catch (e) {
+      // ⚠️ 用 `errDetail` 而不是 `String(e)` —— 详见 errDetail 上方那段说明：
+      //    裸 `fetch failed` 丢掉了 `e.cause`，会让故障**无法归因**。
+      out.ossErr = errDetail(e);
+      ossUnreadable = !!OSS_BUCKET;
+    }
+    // 🔴 **`ossErr` 必须在两条路径上都设置。**
+    //    实测踩到：`ossGet` 对 **HTTP 非 200** 是 `return null`（不抛），
+    //    所以上面那个 catch **根本不会执行** ⇒ `out.ossErr` 永远是 undefined
+    //    ⇒ 告警正文里那行「【OSS 错误】」永远显示「(无)」——
+    //    400/403/404 这些**最有诊断价值**的失败反而最没有信息。
+    //    （与原来那个 `fetch failed` 丢 cause 是同一类缺陷：观测点在错的路径上。）
+    //    这里统一从 `OSS_DIAG` 补上。
+    if (!out.ossErr && OSS_DIAG && OSS_DIAG !== 'HTTP 200') {
+      out.ossErr = OSS_DIAG;
+    }
     const halted = tagHalted || ossHalted;   // 任一来源说已停机，就不拉起
     out.effGb = (effGb === null) ? null : Number(effGb.toFixed(3));
     out.halted = halted ? 1 : 0;
@@ -378,21 +621,29 @@ async function decide(source, evKeys, evResId, isPreempt, isLiveness) {
         // ⚠️ 读不到 OSS 不能"当作没有记录" —— 那样失联检测会静默失效。
         //    OSS_BUCKET 已配置却读不到，本身就是需要响铃的故障。
         out.action = 'error-oss-unreadable';
-        out.push = await push('！！ CDT FC 读不到 OSS 状态',
+        // ⚠️ 带冷却：这条判据是**持续**故障，而定时器 8 分钟一次 ——
+        //    没有冷却就会每 8 分钟响一次，直到 OSS 恢复（约 180 条/天）。
+        //    本次真实误报（一次瞬时抖动）正是缺这个区分的表现。
+        out.push = await pushThrottled('oss-unreadable', '！！ CDT FC 读不到 OSS 状态',
           bodyText(s, effGb, halted, tagVal,
             '【动作】未做任何操作' + NL +
             '【说明】OSS_BUCKET 已配置但读取失败（403/404/网络/解析失败）。' + NL +
+            '⏱ 已自动重试 ' + OSS_ATTEMPTS + ' 次、每次 ' + OSS_TIMEOUT_MS
+              + 'ms 超时 —— 所以走到这里意味着**持续**失败，不是单次抖动。' + NL +
             '在此期间**失联检测与审计同时失效** —— 故本判据改为响铃。' + NL +
             '护闸的停机逻辑不受影响（停机锁 Tag 仍是权威判据）。' + NL +
             '【OSS 错误】' + (out.ossErr || '(无)') + NL +
-            '【OSS 桶】' + OSS_BUCKET));
+            '【OSS 桶】' + OSS_BUCKET), out, isLiveness);
       } else if (ossTsMissing) {
         // 🔴 与上面那条刻意分开：**读取是成功的**，只是对象里没有可用的时间戳。
         //    这种情况下 staleMs 会被算成 0、失联告警永远不响 —— 是个 fail-open。
         //    文案必须如实说「读到了，但里面没有时间戳」，不能冒充「读不到」。
         //    动作名也用独立的 —— 便于从 last-run.json / 日志里区分这两种故障。
         out.action = 'error-oss-ts-missing';
-        out.push = await push('！！ CDT FC：OSS 对象里没有可用时间戳',
+        // ⚠️ 带冷却：与上一条同理 —— 这是**持续**状况（对象缺 ts 不会自己好），
+        //    8 分钟定时器下没有冷却就是刷屏。
+        out.push = await pushThrottled('oss-ts-missing',
+          '！！ CDT FC：OSS 对象里没有可用时间戳',
           bodyText(s, effGb, halted, tagVal,
             '【动作】未做任何操作' + NL +
             '【说明】状态对象**读到了**，但 `ts` 字段缺失或无法解析。' + NL +
@@ -400,17 +651,21 @@ async function decide(source, evKeys, evResId, isPreempt, isLiveness) {
             '而它是「护闸已死」唯一的外部观测手段。故本判据改为响铃。' + NL +
             '⚠️ 常见成因：对象是被手工写入的**诱饵**，或写入被中途截断。' + NL +
             '【实际读到】' + JSON.stringify(out.ossTs) + NL +
-            '【对象里的字段】' + Object.keys(st || {}).join(', ')));
+            '【对象里的字段】' + Object.keys(st || {}).join(', ')), out, isLiveness);
       } else if (staleMs > STALE_MIN * 60 * 1000) {
         const mins = Math.round(staleMs / 60000);
         out.guardStaleMin = mins;
         out.action = 'error-guard-stale';
-        out.push = await push('！！ CDT 护闸疑似失联',
+        // ⚠️ 带冷却。这条尤其重要：护闸一旦真的死掉，它会**一直**是失联状态，
+        //    而它是「护闸已死」唯一的外部观测手段 —— 8 分钟响一次没有额外信息，
+        //    只会让人把这条最重要的告警**静音**掉（那才是真正的损失）。
+        //    冷却不降低观测能力：last-run.json 里每次的 action 照常记录。
+        out.push = await pushThrottled('guard-stale', '！！ CDT 护闸疑似失联',
           bodyText(s, effGb, halted, tagVal,
             '【动作】未做任何操作 — 实例在跑，但护闸已 ' + mins + ' 分钟没写状态' + NL +
             '【OSS 状态时间】' + (out.ossTs || '(无)') + NL +
             '超过 ' + STALE_MIN + ' 分钟即判失联。护闸可能崩溃循环 / 卡死 /' + NL +
-            'AK 失效 / 只读根分区。注意 rc-service status 仍可能显示 started。'));
+            'AK 失效 / 只读根分区。注意 rc-service status 仍可能显示 started。'), out, isLiveness);
       } else if (source === 'timer' && !isLiveness) {
         // ⚠️ 必须排除存活巡检 —— 它每 8 分钟来一次，推报告会变成刷屏。
         //    存活巡检是**静默**的：只有失联（上面那个分支）才说话。
@@ -429,9 +684,26 @@ async function decide(source, evKeys, evResId, isPreempt, isLiveness) {
     }
     if (halted) {
       out.action = 'skip-halted';
-      out.push = await push('CDT 实例停机中（流量已达阈值）',
+      // 🔴 **这条曾经是最大的重复推送源：（实测）存活巡检下每次都推，
+      //    外推到约 180 条/天、一个月约 5400 条。**
+      //
+      //    而「额度已用尽 ⇒ 实例停机」是**设计上的稳态**，不是故障 ——
+      //    它可能持续整月。8 分钟一条通知不带来任何新信息，
+      //    只会让人把通知静音（那才是真正的损失）。
+      //
+      //    ⚠️ 这个 bug 的形状值得记：**当日志分支刻意排除了存活巡检，
+      //       却漏了这条稳态分支** —— 上面「每日巡检报告」那条写着
+      //       「必须排除存活巡检…否则会变成刷屏」，而同在 s!=='Stopped'
+      //       之外的这一条没享受到同样的处理。
+      //       实测发现方式是：模拟「额度用尽」稳态连打 12 次，数推送条数。
+      //
+      //    判据与 action 都不变，只是存活巡检下**不推送**；
+      //    每日巡检（daily-0005-cst）和事件触发时照常推 ——
+      //    所以「今天有没有停机」这件事每天仍会被主动告知一次。
+      out.push = await pushThrottled('skip-halted', 'CDT 实例停机中（流量已达阈值）',
         bodyText(s, effGb, halted, tagVal,
-          '【动作】不拉起 — 等待次月 1 日 00:00 (UTC+8) 额度重置'));
+          '【动作】不拉起 — 等待次月 1 日 00:00 (UTC+8) 额度重置'),
+        out, isLiveness, { silentWhenLiveness: true });
       return out;
     }
     // ── 拉起熔断：1 小时内已拉起 >= LOOP_MAX 次就不拉了 ──────────────
@@ -442,13 +714,19 @@ async function decide(source, evKeys, evResId, isPreempt, isLiveness) {
     out.recentStarts = recent.length;
     if (recent.length >= LOOP_MAX) {
       out.action = 'start-blocked-loop';
-      out.push = await push('!! CDT 拉起已熔断（疑似死循环）',
+      // ⚠️ 也带冷却。这条本身已经有「1 小时内 ≥ LOOP_MAX 次」的窗口，
+      //    所以它**天然不会**每 8 分钟都成立（要连续拉起失败才触发）；
+      //    但一旦成立就会持续成立 —— 加冷却避免它变成第二个刷屏源。
+      //    熔断行为本身完全不变（仍然拒绝拉起），只是不重复通知。
+      out.push = await pushThrottled('start-blocked-loop',
+        '!! CDT 拉起已熔断（疑似死循环）',
         bodyText(s, effGb, halted, tagVal,
           '【动作】拒绝拉起 — 1 小时内已拉起 ' + recent.length + ' 次' + NL +
           '【说明】tag 与 OSS 两条停机判据可能都在写失败，导致：' + NL +
           'FC 拉起 -> 护闸开机 -> 立刻又停机 -> FC 又拉起……' + NL +
           '每轮都在烧流量、每轮都推一条通知。' + NL +
-          '请人工检查护闸的 tag_halted() 与 oss_put() 是否正常。'));
+          '请人工检查护闸的 tag_halted() 与 oss_put() 是否正常。'),
+        out, isLiveness);
       return out;
     }
     const r = await startInst();
