@@ -23,9 +23,11 @@
 // ⚠️ **所有会反复出现的告警都走 `pushThrottled`（1 小时冷却）。**
 //    判据不变、`action` 不变、`last-run.json` 照常记录 —— 少掉的只是重复通知。
 //    为什么必须有：存活巡检 8 分钟一次，没有冷却就是约 180 条/天。
-//    ⚠️ 冷却状态**双存储**（OSS + 模块内存）：只存 OSS 有个自相矛盾的失效 ——
-//       最需要冷却的「OSS 读不到」场景，恰好读不到冷却状态。
-//       详见 `alertAllowed` 上方那段。
+//    ⚠️ 冷却状态**三层存储**（OSS + 模块内存 + ECS 实例 Tag）：缺任何一层都有洞。
+//       最需要冷却的「OSS 读不到」场景恰好读不到 OSS，而本函数未开预留实例、
+//       8 分钟一次很可能落在冷实例上 —— 所以必须有一条**与 OSS 不同故障域**的
+//       持久路径，即 ECS Tag（读它是免费的：`instInfo()` 本来就拉回了全部 Tag）。
+//       实测过前两层的洞，详见 `alertAllowed` 上方那段。
 //    ⚠️ 一次性/低频的告警（每日巡检、拉起成功、spot 预警、FC 异常）
 //       仍用裸 `push()` —— 它们本来就不会每 8 分钟重复，加冷却反而可能
 //       把一次真实事件吞掉。
@@ -142,7 +144,22 @@ const OSS_ENDPOINT = process.env.OSS_ENDPOINT || 'oss-cn-hongkong.aliyuncs.com';
 //              任何持续状况都会每 8 分钟响一次（约 180 条/天）。
 //              实测确认的重复源有三个：OSS 读不到、护闸失联、
 //              以及 **skip-halted（额度用尽的设计稳态，一个月里最大宗）**。
-const VER = 'v6-oss-retry-cooldown';
+//       v7：三个改动，全部来自**第二条线上告警**（2026-10-15 01:48）的复核。
+//           那条告警的正文是 `cause=ENOTFOUND ... oss-cn-hongkong.aliyuncs.com`
+//           —— **DNS 解析失败**，而当时护闸正在 ECS 上正常读写同一个桶。
+//           ① **DNS 类故障的重试间隔单列**（600ms → 5s）。原重试对 DNS 是无效的：
+//              两次尝试落在同一秒内，第二次必然命中解析器的同一份负缓存。
+//              实测那条告警自己写着"已重试 2 次"，两次都在 1 秒内 —— 等于只试了一次。
+//           ② **告警文案不再替读者下结论**。旧文案写「已重试 2 次…所以这意味着
+//              **持续**失败」—— 600ms 的窗口证明不了"持续"，本次就是这样被
+//              错报成持续性故障的。改为如实报出"试了几次、共跨多久、哪一类错"。
+//           ③ **冷却补第三条存储**（ECS 实例 Tag）。v6 的「OSS + 内存」两层
+//              在最需要它时都失效：OSS 读不到时 OSS 那层必然失效，而本函数
+//              未开预留实例（实测 target=0）、8 分钟一次大概率是冷实例，
+//              内存那层也是空的。**实测过这个洞**：模拟 OSS 全程不可达，
+//              冷实例 4 次调用推 4 条。Tag 那条与 OSS 是不同故障域，
+//              且读它零成本（DescribeInstances 本来就返回全部 Tag）。
+const VER = 'v7-dns-retry-cooldown-tag';
 const STATE_KEY = 'cdtguard/state.json';
 const PUSH_TOKEN = requireEnv('PUSH_TOKEN');
 
@@ -157,6 +174,41 @@ const OSS_TIMEOUT_MS = 8000;
 const OSS_RETRY_DELAY_MS = 600;
 // 重试次数（总尝试次数，不是"额外重试次数"）。
 const OSS_ATTEMPTS = 2;
+
+// ⚠️⚠️ **DNS 类故障的重试间隔必须另算 —— 600ms 对它是无效的。**
+//    🔴 来历：2026-10-15 01:48 又收到一条「读不到 OSS 状态」，正文里带着
+//       `cause=ENOTFOUND getaddrinfo ENOTFOUND ...oss-cn-hongkong.aliyuncs.com`。
+//       那是 **DNS 解析失败**，而当时护闸（在 ECS 上）正一路正常读写同一个桶 ——
+//       01:32 / 01:42 / 01:52 / 02:02 四条采样齐整，全天 0 错误。
+//       也就是说：**OSS 没挂，是 FC 侧这一瞬间解析不出域名。**
+//
+//    ⚠️ 关键在于**时间尺度**：连接类抖动（ECONNRESET 等）是毫秒级的，
+//       600ms 重试有意义；而 DNS 失败背后通常是**解析器的负缓存**，
+//       按**秒**计。在同一秒内重试两次，第二次几乎必然命中同一份负缓存 ——
+//       等于**只试了一次**。所以 600ms 的重试对这次故障完全不起作用。
+//       （实测证据：那条告警里写着"已自动重试 2 次"，两次都落在同一秒内。）
+//
+//    ⇒ 判据不变（读不到仍然响铃），只是让重试**跨过 DNS 的时间尺度**。
+//    ⚠️ 上限被 60 秒函数超时钉死：2 次尝试 × 8s 超时 + 5s 间隔 ≈ 21s 最坏情况，
+//       给后面的 ECS 调用 / 推送 / 心跳留够余量。
+//       **不要再加尝试次数** —— 3 次就是 34s，会把函数超时吃掉。
+const OSS_RETRY_DELAY_DNS_MS = 5000;
+
+// DNS 类错误码。Node 把它们挂在 `e.cause.code` 上（见 errDetail 上方的说明）。
+//   ENOTFOUND / EAI_NODATA : 域名解析不到（本次线上遇到的就是 ENOTFOUND）
+//   EAI_AGAIN              : 解析器临时失败（超时/不可达），通常**很短命**
+//   EAI_FAIL               : 解析器返回了不可恢复的错误
+const DNS_ERR_CODES = ['ENOTFOUND', 'EAI_NODATA', 'EAI_AGAIN', 'EAI_FAIL', 'ENODATA'];
+function isDnsErr(e) {
+  if (!e) return false;
+  const c = e.cause || {};
+  // 有的实现把 code 放在 cause 上，有的放顶层 —— 两处都看
+  const codes = [c.code, c.errno, e.code].filter(Boolean).map(String);
+  return codes.some(function (x) { return DNS_ERR_CODES.indexOf(x) >= 0; });
+}
+
+// 最近一次 OSS 读取的归因（供告警正文**如实**说明"试了几次、跨了多久"）。
+let OSS_LAST = { attempts: 0, windowMs: 0, errClass: '' };
 
 // ── 告警冷却 ────────────────────────────────────────────────────────
 // 🔴 为什么要它：`push()` 本身**没有任何去重或冷却**（实测：连续调用 6 次，
@@ -299,8 +351,14 @@ async function ossGet(key, opt) {
   const attempts = o.attempts || OSS_ATTEMPTS;
   const timeoutMs = o.timeoutMs || OSS_TIMEOUT_MS;
   let lastErr = null;
+  const startedAt = Date.now();
   for (let i = 0; i < attempts; i++) {
-    if (i) await new Promise((r) => setTimeout(r, OSS_RETRY_DELAY_MS));
+    if (i) {
+      // ⚠️ 间隔按**上一次失败的类别**选：DNS 类要跨过解析器的负缓存（秒级），
+      //    连接类抖动用短的即可。见 OSS_RETRY_DELAY_DNS_MS 上方的实测来历。
+      const wait = isDnsErr(lastErr) ? OSS_RETRY_DELAY_DNS_MS : OSS_RETRY_DELAY_MS;
+      await new Promise((r) => setTimeout(r, wait));
+    }
     try {
       const date = new Date().toUTCString();
       const sts = ['GET', '', '', date, '/' + OSS_BUCKET + '/' + key].join(NL);
@@ -311,19 +369,28 @@ async function ossGet(key, opt) {
       if (r.status !== 200) {
         // 确定性失败：记下状态码，不重试
         OSS_DIAG = 'HTTP ' + r.status;
+        OSS_LAST = { attempts: i + 1, windowMs: Date.now() - startedAt, errClass: 'http' };
         return null;
       }
       try {
         const j = JSON.parse(await r.text());
         OSS_DIAG = 'HTTP 200';
+        OSS_LAST = { attempts: i + 1, windowMs: Date.now() - startedAt, errClass: '' };
         return j;
       } catch (e) {
         OSS_DIAG = 'HTTP 200 但正文不是合法 JSON: ' + String(e).slice(0, 80);
+        OSS_LAST = { attempts: i + 1, windowMs: Date.now() - startedAt, errClass: 'parse' };
         return null;
       }
     } catch (e) {
       lastErr = e;
       OSS_DIAG = errDetail(e);
+      // 归因：试了几次、跨了多久、哪一类错 —— 告警正文靠它说实话
+      OSS_LAST = {
+        attempts: i + 1,
+        windowMs: Date.now() - startedAt,
+        errClass: isDnsErr(e) ? 'dns' : 'network',
+      };
     }
   }
   // 全部尝试都失败 ⇒ 抛出去，让调用方按「读不到」处理（fail-loud）
@@ -355,47 +422,124 @@ async function ossPut(key, obj) {
 //      · 「护闸疑似失联」
 //      · **skip-halted** —— 额度用尽后的**设计稳态**，一个月里可能长期如此
 //
-// ⚠️⚠️ **双存储，缺一不可。** 只存 OSS 会有个自相矛盾的失效：
-//    最需要冷却的场景恰恰是 **OSS 读不到**的时候 —— 那时冷却状态也读不到，
-//    于是每次都旁路、每次都推，冷却在最需要它时正好不起作用（实测这个矛盾）。
-//    所以：
-//      · **OSS**（跨实例、跨冷启动都有效）—— 读不到就跳过它
-//      · **模块级内存**（同一热实例内有效）—— OSS 挂掉时由它兜底
-//    取两者的**较新值**判断。FC 的热实例会被复用若干次，
-//    足够把「OSS 全程不可用」这种极端情况下的推送频率压下来。
-//    ⚠️ 两者都拿不到（冷启动 + OSS 挂）时**仍然告警** —— 宁可多推，绝不静默。
+// ⚠️⚠️ **三层存储，各管一段，缺一不可。**
+//    每一层补的都是上一层的失效场景：
+//
+//    ① **OSS**（跨实例、跨冷启动）—— 主力。
+//       但它在**最需要冷却的场景**里恰好不可用：OSS 读不到的时候，
+//       冷却状态也读不到。所以必须有下面两层。
+//
+//    ② **模块级内存**（同一热实例内）—— OSS 不可用时兜底。
+//       ⚠️ 但它只在**热实例**上有效，而本函数未开预留实例
+//       （实测 GetProvisionConfig: target=0）⇒ 8 分钟一次的调用
+//       很可能每次都是冷实例，内存态是空的。
+//       **实测过这个洞**：模拟「OSS 全程不可达」，热实例 2 次调用推 1 条（对），
+//       冷实例 4 次调用推 4 条（等于没有冷却）。
+//
+//    ③ **ECS 实例 Tag**（跨实例、跨冷启动，且**与 OSS 是不同的故障域**）——
+//       补的就是 ② 那个洞。
+//       · 读是**免费的**：`instInfo()` 每次调用都已经拉回了实例的全部 Tag，
+//         冷却时间戳直接从里面取，**零额外 API 调用**。
+//       · 写只在告警时发生（一条 `TagResources`），频率极低。
+//       · ⚠️ 关键性质：**OSS 挂掉时 ECS API 很可能仍然通**。
+//         这不是假设 —— 2026-10-15 那条告警的正文里带着「【实例状态】Running」，
+//         那正是 `DescribeInstances` 成功返回的结果：**OSS 域名解析失败的同时，
+//         ECS 域名解析是好的**。两个独立的故障域，这才使得它有意义。
+//         （反之若整个解析器都坏了，三层全失效 ⇒ 仍然告警，见下。）
+//
+//    取三者的**较新值**判断。
+//    ⚠️ 三层全拿不到时**仍然告警** —— 宁可多推，绝不静默。
 //       这与「读不到 OSS 就响铃」的方向一致。
 const _memAlertAt = Object.create(null);   // kind -> ms（热实例内有效）
 
-async function alertAllowed(kind) {
+// ECS Tag 上的冷却键前缀。每个告警类型一个键（便于人工在控制台看出是什么）。
+// ⚠️ 一个实例最多几十个 Tag，本函数只用到 3 个以内，不会顶到上限。
+const ALERT_TAG_PREFIX = 'cdt-fc-alert-';
+
+// 从**已经取回的**实例 Tag 里读冷却时间戳（零额外 API 调用）。
+// ⚠️ 只认能解析成正整数的值 —— 手工写坏的 Tag 不该被当成"刚刚告警过"
+//    而把真告警吞掉（那是 fail-silent，方向错误）。
+function tagCooldownAt(tags, kind) {
+  if (!tags) return 0;
+  const n = parseInt(tags[ALERT_TAG_PREFIX + kind], 10);
+  return (Number.isFinite(n) && n > 0) ? n : 0;
+}
+
+// 尽力写一次冷却 Tag。返回状态串供返回体透出（写失败不影响告警本身）。
+//
+// ⚠️ **参数名必须是 `ResourceId.1` / `Tag.1.Key` 这种点号形式**（阿里云 RPC 风格
+//    的可重复参数）。已实测确认这条路可行，两点值得记：
+//      · 用**命令行/MCP 工具**调 `TagResources` 传点号参数会**被拒**：
+//        `OpenApiParamUnknown: parameter 'ResourceId.1' is not listed in OpenMeta`。
+//        那是**工具侧的元数据校验**，不是 ECS API 拒收 —— 别据此以为这条路不通。
+//      · 真实 API 接受这种形状：实测写 `cdt-fc-alert-__selftest` → 200 +
+//        RequestId，`DescribeInstances` 立刻读得回来；`UntagResources` 也认
+//        `TagKey.1`。（自检 Tag 已清理。）
+//    ⇒ 所以这里的手写签名请求（aliCall）是可行路径，而工具链不是。
+async function tagSetCooldown(kind, ms) {
+  try {
+    const r = await aliCall('TagResources', '2014-05-26', {
+      RegionId: REGION, ResourceType: 'instance',
+      'ResourceId.1': INSTANCE_ID,
+      'Tag.1.Key': ALERT_TAG_PREFIX + kind,
+      'Tag.1.Value': String(ms)
+    }, 'ecs.aliyuncs.com');
+    if (r && r.Code) return 'ERR ' + r.Code;
+    if (r && r.parseError) return 'ERR parse';
+    return 'OK';
+  } catch (e) { return 'ERR ' + String(e).slice(0, 60); }
+}
+
+async function alertAllowed(kind, instTags) {
   const now = Date.now();
   let ossLast = 0;
-  let ossOk = false;
   let ossState = null;
+  // ⚠️⚠️ `ossUsable` 必须表示「**OSS 这个存储能不能用**」，
+  //    而**不是**「刚才那次调用有没有抛异常」。
+  //    实测踩到的区别：`ossGet` 对 HTTP 403 是 `return null`（**不抛**）——
+  //    若把"没抛"当成"OSS 可用"，那么 OSS 返回 403 时我们会以为
+  //    「冷却已经写进 OSS 了」，于是**永远不去写 Tag**，
+  //    第三层存储在最需要它的场景里根本不会启用（等于白加）。
+  //    判据改成看 `OSS_DIAG`：只有「对象存在(200)」或「对象不存在(404，
+  //    首次告警前就是这样)」才算可用；403/网络错误/解析失败都算不可用。
+  let ossUsable = false;
   try {
-    // attempts:1 —— 冷却查询是尽力而为，不值得为它再花一份超时预算
     ossState = await ossGet(ALERT_STATE_KEY, { attempts: 1, timeoutMs: 4000 });
-    ossOk = true;
-    ossLast = (ossState && ossState[kind]) || 0;
+    ossUsable = (OSS_DIAG === 'HTTP 200' || OSS_DIAG === 'HTTP 404');
+    if (ossUsable) ossLast = (ossState && ossState[kind]) || 0;
   } catch (e) {
-    // 读不到就退回内存态 —— 不旁路
+    ossUsable = false;
   }
   const memLast = _memAlertAt[kind] || 0;
-  const last = Math.max(ossLast, memLast);
+  const tagLast = tagCooldownAt(instTags, kind);
+  const last = Math.max(ossLast, memLast, tagLast);
 
   if (last && (now - last) < ALERT_COOLDOWN_MS) {
-    return { allowed: false, lastAt: last, bypassed: false };
+    return { allowed: false, lastAt: last, by: ossLast >= last ? 'oss'
+               : (tagLast >= last ? 'tag' : 'mem') };
   }
 
   // 先记时间戳再返回"允许"。记录失败**不阻止**本次告警（见上）。
   _memAlertAt[kind] = now;
-  if (ossOk) {
+  const wrote = [];
+  if (ossUsable) {
     try {
       const merged = Object.assign({}, ossState || {});
       merged[kind] = now;
-      await ossPut(ALERT_STATE_KEY, merged);
+      const st = await ossPut(ALERT_STATE_KEY, merged);
+      // ⚠️ 必须看**状态码**：`ossPut` 对非 200 不抛，只看"没抛"会假报写成功。
+      if (st === 200) wrote.push('oss');
     } catch (e) { /* 写不进不影响本次告警 */ }
   }
+  // ⚠️ 只在**冷却没能写进 OSS**时才去动实例 Tag ——
+  //    正常路径（OSS 健康）不产生任何额外 API 调用。
+  //    这正是「OSS 读不到」那个场景：OSS 那层必然写不进，于是落到这里。
+  let tagWrite = null;
+  if (wrote.indexOf('oss') < 0) {
+    tagWrite = await tagSetCooldown(kind, now);
+    if (tagWrite === 'OK') wrote.push('tag');
+  }
+  return { allowed: true, lastAt: last, wrote: wrote, tagWrite: tagWrite };
   // 两个存储都没用上 ⇒ 显式标记，便于事后解释"为什么又推了"
   const bypassed = !ossOk && !memLast;
   return { allowed: true, lastAt: last, bypassed };
@@ -423,17 +567,21 @@ async function pushThrottled(kind, title, content, out, isLiveness, opts) {
     if (out) { out.pushSkipped = kind + '(liveness 静默)'; }
     return '(存活巡检：稳态，按设计不推送；状态仍写入 last-run.json)';
   }
-  const g = await alertAllowed(kind);
+  // ⚠️ `instTags` 由调用方传入 —— 它是**已经取回的**实例 Tag（零额外 API 调用），
+  //    作为 OSS 之外的第二条持久化冷却路径。见 alertAllowed 上方的三层说明。
+  const g = await alertAllowed(kind, o.instTags);
   if (!g.allowed) {
     if (out) {
       out.pushSkipped = kind;
       out.pushCooldownMin = Math.round(ALERT_COOLDOWN_MS / 60000);
+      out.pushCooldownBy = g.by || 'unknown';   // 哪一层挡住了（便于核实三层是否都在工作）
     }
     return '(冷却中：同一告警在 ' + Math.round(ALERT_COOLDOWN_MS / 60000)
              + ' 分钟内已推过一次，本次未重复推送)';
   }
-  if (out && g.bypassed) {
-    out.cooldownBypassed = true;
+  if (out && g.tagWrite) {
+    // 只有真的走了 Tag 那条路才记录，避免正常路径上多出无意义的字段
+    out.cooldownTagWrite = g.tagWrite;
   }
   return await push(title, content);
 }
@@ -628,12 +776,27 @@ async function decide(source, evKeys, evResId, isPreempt, isLiveness) {
           bodyText(s, effGb, halted, tagVal,
             '【动作】未做任何操作' + NL +
             '【说明】OSS_BUCKET 已配置但读取失败（403/404/网络/解析失败）。' + NL +
-            '⏱ 已自动重试 ' + OSS_ATTEMPTS + ' 次、每次 ' + OSS_TIMEOUT_MS
-              + 'ms 超时 —— 所以走到这里意味着**持续**失败，不是单次抖动。' + NL +
+            // ⚠️ **只陈述事实，不做超出证据的推断。**
+            //    旧文案写「已重试 2 次…所以走到这里意味着**持续**失败」——
+            //    而两次尝试只隔 600ms，**证明不了"持续"**。实测正是如此：
+            //    2026-10-15 那次是 DNS 瞬时失败（ENOTFOUND），被这句话
+            //    错误地描述成了持续性故障。
+            //    ⇒ 改为如实报出：试了几次、**总共跨了多久**、哪一类错误。
+            //      读的人据此自己判断，而不是被文案替他去判断。
+            '⏱ 已尝试 ' + (OSS_LAST.attempts || OSS_ATTEMPTS) + ' 次，累计耗时约 '
+              + Math.round((OSS_LAST.windowMs || 0) / 1000) + ' 秒'
+              + (OSS_LAST.errClass === 'dns'
+                  ? '（含 DNS 解析重试间隔 ' + Math.round(OSS_RETRY_DELAY_DNS_MS / 1000) + 's）'
+                  : '') + NL +
+            '【性质】'
+              + (OSS_LAST.errClass === 'dns'
+                  ? 'DNS 解析失败 —— 通常是**短暂**的解析器故障，不必然是 OSS 故障。'
+                    + NL + '　　⚠️ 判据是"读不到就响"，所以瞬时解析失败也会触发本条。'
+                  : '网络/HTTP 失败。') + NL +
             '在此期间**失联检测与审计同时失效** —— 故本判据改为响铃。' + NL +
             '护闸的停机逻辑不受影响（停机锁 Tag 仍是权威判据）。' + NL +
             '【OSS 错误】' + (out.ossErr || '(无)') + NL +
-            '【OSS 桶】' + OSS_BUCKET), out, isLiveness);
+            '【OSS 桶】' + OSS_BUCKET), out, isLiveness, { instTags: info.tags });
       } else if (ossTsMissing) {
         // 🔴 与上面那条刻意分开：**读取是成功的**，只是对象里没有可用的时间戳。
         //    这种情况下 staleMs 会被算成 0、失联告警永远不响 —— 是个 fail-open。
@@ -651,7 +814,8 @@ async function decide(source, evKeys, evResId, isPreempt, isLiveness) {
             '而它是「护闸已死」唯一的外部观测手段。故本判据改为响铃。' + NL +
             '⚠️ 常见成因：对象是被手工写入的**诱饵**，或写入被中途截断。' + NL +
             '【实际读到】' + JSON.stringify(out.ossTs) + NL +
-            '【对象里的字段】' + Object.keys(st || {}).join(', ')), out, isLiveness);
+            '【对象里的字段】' + Object.keys(st || {}).join(', ')), out, isLiveness,
+          { instTags: info.tags });
       } else if (staleMs > STALE_MIN * 60 * 1000) {
         const mins = Math.round(staleMs / 60000);
         out.guardStaleMin = mins;
@@ -665,7 +829,8 @@ async function decide(source, evKeys, evResId, isPreempt, isLiveness) {
             '【动作】未做任何操作 — 实例在跑，但护闸已 ' + mins + ' 分钟没写状态' + NL +
             '【OSS 状态时间】' + (out.ossTs || '(无)') + NL +
             '超过 ' + STALE_MIN + ' 分钟即判失联。护闸可能崩溃循环 / 卡死 /' + NL +
-            'AK 失效 / 只读根分区。注意 rc-service status 仍可能显示 started。'), out, isLiveness);
+            'AK 失效 / 只读根分区。注意 rc-service status 仍可能显示 started。'), out, isLiveness,
+          { instTags: info.tags });
       } else if (source === 'timer' && !isLiveness) {
         // ⚠️ 必须排除存活巡检 —— 它每 8 分钟来一次，推报告会变成刷屏。
         //    存活巡检是**静默**的：只有失联（上面那个分支）才说话。
@@ -703,7 +868,7 @@ async function decide(source, evKeys, evResId, isPreempt, isLiveness) {
       out.push = await pushThrottled('skip-halted', 'CDT 实例停机中（流量已达阈值）',
         bodyText(s, effGb, halted, tagVal,
           '【动作】不拉起 — 等待次月 1 日 00:00 (UTC+8) 额度重置'),
-        out, isLiveness, { silentWhenLiveness: true });
+        out, isLiveness, { silentWhenLiveness: true, instTags: info.tags });
       return out;
     }
     // ── 拉起熔断：1 小时内已拉起 >= LOOP_MAX 次就不拉了 ──────────────
@@ -726,7 +891,7 @@ async function decide(source, evKeys, evResId, isPreempt, isLiveness) {
           'FC 拉起 -> 护闸开机 -> 立刻又停机 -> FC 又拉起……' + NL +
           '每轮都在烧流量、每轮都推一条通知。' + NL +
           '请人工检查护闸的 tag_halted() 与 oss_put() 是否正常。'),
-        out, isLiveness);
+        out, isLiveness, { instTags: info.tags });
       return out;
     }
     const r = await startInst();
